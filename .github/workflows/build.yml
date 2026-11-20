@@ -122,6 +122,7 @@ jobs:
           package com.bot.cook
 
           // Все координаты заданы для экрана 2576x1159 и автоматически масштабируются под телефон.
+          // Значения сверены с видео, где касания были видны на экране.
           object Cfg {
               fun p(x: Int, y: Int) = intArrayOf(x, y)
 
@@ -131,26 +132,29 @@ jobs:
               val POT_SRC = p(780, 1080)
               val FRY1 = p(650, 880)
               val FRY2 = p(800, 880)
-              val SAUSAGE = p(1080, 710)
+              val SAUSAGE = p(1085, 725)
               val ONION = p(1090, 590)
-              val BASE1 = p(1280, 610)
-              val BASE2 = p(1280, 740)
+              val BASE1 = p(1290, 600)
+              val BASE2 = p(1290, 745)
               val OVENS = listOf(p(1220, 890), p(1220, 985), p(1220, 1070))
-              val LETTUCE = p(1795, 610)
-              val TOMATO = p(1810, 720)
-              val BUN = p(1700, 900)
-              val PATTY = p(2100, 960)
+              val LETTUCE = p(1795, 600)
+              val TOMATO = p(1810, 725)
+              val BUN = p(1740, 905)
+              val PATTY = p(2110, 955)
               val GRILLS = listOf(p(1970, 670), p(2170, 670), p(1990, 760), p(2170, 760))
 
-              // Где лежит готовое блюдо каждого типа
+              // Где лежит готовое блюдо каждого типа (оттуда его тянут к клиенту)
               val SERVE: Map<String, List<IntArray>> = mapOf(
                   "cola" to listOf(p(415, 590), p(470, 615), p(540, 565)),
                   "icecream" to listOf(p(320, 1030), p(400, 1030), p(480, 990)),
                   "burger" to listOf(p(1480, 620), p(1640, 620), p(1490, 730), p(1650, 730)),
-                  "pizza" to listOf(BASE1, BASE2),
+                  "pizza" to OVENS,
                   "fries" to listOf(p(855, 610), p(850, 720)),
                   "chicken" to listOf(p(700, 620), p(690, 730))
               )
+
+              // Куда тянуть блюдо: клиент стоит левее своего окошка заказа
+              fun customer(slotX: Int) = p(slotX - 150, 430)
           }
           EOF_8
           mkdir -p bot/app/src/main/java/com/bot/cook
@@ -267,35 +271,50 @@ jobs:
           package com.bot.cook
 
           import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Paint
           import android.graphics.PixelFormat
+          import android.graphics.Rect
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
           import android.media.ImageReader
           import android.media.projection.MediaProjection
 
           class Capture(proj: MediaProjection, private val w: Int, private val h: Int, dpi: Int) {
-              private val reader: ImageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+              private val reader: ImageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
               private val vd: VirtualDisplay = proj.createVirtualDisplay(
                   "cookbot", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, null
               )
-              private var last: Bitmap? = null
+              // Битмапы создаются один раз и переиспользуются, чтобы не забивать память
+              private val out: Bitmap = Bitmap.createBitmap(Vision.RW, Vision.RH, Bitmap.Config.ARGB_8888)
+              private val canvas = Canvas(out)
+              private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+              private val src = Rect(0, 0, w, h)
+              private val dst = Rect(0, 0, Vision.RW, Vision.RH)
+              private var raw: Bitmap? = null
+              private var have = false
 
               // Последний кадр, приведённый к размеру 2576x1159
               fun frame(): Bitmap? {
                   val img = reader.acquireLatestImage()
                   if (img != null) {
-                      val p = img.planes[0]
-                      val tmp = Bitmap.createBitmap(p.rowStride / p.pixelStride, h, Bitmap.Config.ARGB_8888)
-                      tmp.copyPixelsFromBuffer(p.buffer)
-                      img.close()
-                      val cropped = Bitmap.createBitmap(tmp, 0, 0, w, h)
-                      val scaled = Bitmap.createScaledBitmap(cropped, Vision.RW, Vision.RH, true)
-                      if (cropped !== scaled) cropped.recycle()
-                      if (tmp !== cropped) tmp.recycle()
-                      last?.recycle()
-                      last = scaled
+                      try {
+                          val p = img.planes[0]
+                          val rw = p.rowStride / p.pixelStride
+                          var t: Bitmap? = raw
+                          if (t == null || t.width != rw) {
+                              t?.recycle()
+                              raw = Bitmap.createBitmap(rw, h, Bitmap.Config.ARGB_8888)
+                          }
+                          val bm: Bitmap = raw!!
+                          bm.copyPixelsFromBuffer(p.buffer)
+                          canvas.drawBitmap(bm, src, dst, paint)
+                          have = true
+                      } finally {
+                          img.close()
+                      }
                   }
-                  return last
+                  return if (have) out else null
               }
 
               fun release() {
@@ -321,6 +340,9 @@ jobs:
           import kotlin.math.max
           import kotlin.math.min
 
+          // Одно действие: нажатие (drag = false) или перетаскивание из (x1,y1) в (x2,y2)
+          class Act(val x1: Int, val y1: Int, val x2: Int, val y2: Int, val drag: Boolean)
+
           class TapService : AccessibilityService() {
               override fun onServiceConnected() {
                   inst = this
@@ -335,19 +357,28 @@ jobs:
                   return super.onUnbind(intent)
               }
 
-              // Серия быстрых нажатий; ждёт завершения
-              private fun doRun(pts: List<IntArray>, gap: Long) {
+              // Серия действий по очереди; ждёт завершения
+              private fun doRun(acts: List<Act>, gap: Long) {
                   val dm = DisplayMetrics()
                   @Suppress("DEPRECATION")
                   (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
                   val sw = max(dm.widthPixels, dm.heightPixels).toFloat()
                   val sh = min(dm.widthPixels, dm.heightPixels).toFloat()
-                  for (chunk in pts.chunked(10)) {
+                  for (chunk in acts.chunked(8)) {
                       val b = GestureDescription.Builder()
-                      chunk.forEachIndexed { i, p ->
+                      var t = 0L
+                      for (a in chunk) {
                           val path = Path()
-                          path.moveTo(p[0] * sw / Vision.RW, p[1] * sh / Vision.RH)
-                          b.addStroke(GestureDescription.StrokeDescription(path, i * gap, 20L))
+                          path.moveTo(a.x1 * sw / Vision.RW, a.y1 * sh / Vision.RH)
+                          val dur: Long
+                          if (a.drag) {
+                              path.lineTo(a.x2 * sw / Vision.RW, a.y2 * sh / Vision.RH)
+                              dur = 280L
+                          } else {
+                              dur = 30L
+                          }
+                          b.addStroke(GestureDescription.StrokeDescription(path, t, dur))
+                          t += dur + gap
                       }
                       val latch = CountDownLatch(1)
                       val ok = dispatchGesture(b.build(), object : GestureResultCallback() {
@@ -359,7 +390,7 @@ jobs:
                               latch.countDown()
                           }
                       }, null)
-                      if (ok) latch.await(chunk.size * gap + 1500, TimeUnit.MILLISECONDS)
+                      if (ok) latch.await(t + 1500, TimeUnit.MILLISECONDS)
                   }
               }
 
@@ -369,8 +400,8 @@ jobs:
 
                   fun ready(): Boolean = inst != null
 
-                  fun run(pts: List<IntArray>, gap: Long = 85L) {
-                      inst?.doRun(pts, gap)
+                  fun run(acts: List<Act>, gap: Long = 120L) {
+                      inst?.doRun(acts, gap)
                   }
               }
           }
@@ -379,17 +410,32 @@ jobs:
           cat > bot/app/src/main/java/com/bot/cook/Engine.kt <<'EOF_12'
           package com.bot.cook
 
+          import android.graphics.Bitmap
+
           class Engine(private val cap: Capture, private val ui: (String) -> Unit) : Thread() {
               @Volatile
               var running = true
               private val last = HashMap<String, Long>()
               private val collectAt = HashMap<String, Long>()
+              private val stock = HashMap<String, Int>()
+              private val prevDem = HashMap<String, Int>()
+              private val changedAt = HashMap<String, Long>()
+              private var frames = 0
+              private var bPhase = 0
+              private var bNeed = 0
+              private var bGot = 0
+              private var bStart = 0L
+              private var pizzaReadyAt = 0L
+              private var pizzaBusyUntil = 0L
+              private val dishes = listOf("cola", "icecream", "chicken", "fries", "pizza", "burger")
               private val ru = mapOf(
                   "pizza" to "пицца", "burger" to "бургер", "cola" to "кола",
                   "icecream" to "мороженое", "fries" to "фри", "chicken" to "курица", "?" to "?"
               )
 
               private fun now() = System.currentTimeMillis()
+
+              private fun st(k: String): Int = stock[k] ?: 0
 
               private fun due(k: String, ms: Long): Boolean {
                   val n = now()
@@ -401,35 +447,128 @@ jobs:
                   return false
               }
 
-              private fun tap(pts: List<IntArray>) {
-                  TapService.run(pts)
-              }
+              private fun tapA(p: IntArray) = Act(p[0], p[1], p[0], p[1], false)
 
-              // Приготовление: нажать источник, подождать cookMs, нажать выход
-              private fun cook(key: String, src: List<IntArray>, out: List<IntArray>, cookMs: Long) {
-                  val c = collectAt[key]
-                  if (c != null) {
-                      if (now() >= c) {
-                          tap(out)
-                          collectAt.remove(key)
-                      }
-                  } else if (due(key, 1500)) {
-                      tap(src)
-                      collectAt[key] = now() + cookMs
-                  }
+              private fun go(acts: List<Act>, gap: Long = 120L) {
+                  if (acts.isNotEmpty()) TapService.run(acts, gap)
               }
 
               override fun run() {
                   while (running) {
                       try {
                           step()
-                      } catch (e: Exception) {
-                          ui("Ошибка: " + e.message)
+                      } catch (e: Throwable) {
+                          ui("Ошибка: " + e.toString())
                       }
                       try {
                           Thread.sleep(150)
                       } catch (e: InterruptedException) {
                           return
+                      }
+                  }
+              }
+
+              // Следим за тем, сколько готовых блюд лежит: заказ ушёл - значит блюдо отдано
+              private fun updateStock(dem: Map<String, Int>) {
+                  val n = now()
+                  for (k in dishes) {
+                      val cur = dem[k] ?: 0
+                      val prev = prevDem[k] ?: 0
+                      if (cur < prev) stock[k] = maxOf(0, st(k) - (prev - cur))
+                      if (cur != prev) changedAt[k] = n
+                      val ch = changedAt[k] ?: n
+                      changedAt[k] = ch
+                      // Заказ не меняется давно, а мы думаем, что блюдо готово: значит оценка неверна
+                      if (cur > 0 && st(k) >= cur && n - ch > 14000L) {
+                          stock[k] = 0
+                          changedAt[k] = n
+                      }
+                      prevDem[k] = cur
+                  }
+              }
+
+              // Приготовление в фритюрнице: нажать источник, подождать, забрать
+              private fun cook(key: String, dish: String, src: IntArray, out: IntArray, cookMs: Long) {
+                  val c = collectAt[key]
+                  if (c != null) {
+                      if (now() >= c) {
+                          go(listOf(tapA(out)))
+                          collectAt.remove(key)
+                          stock[dish] = st(dish) + 1
+                      }
+                  } else if (due(key, 1500L)) {
+                      go(listOf(tapA(src)))
+                      collectAt[key] = now() + cookMs
+                  }
+              }
+
+              private fun serve(slots: List<List<String>>) {
+                  val acts = ArrayList<Act>()
+                  for ((si, items) in slots.withIndex()) {
+                      val counts = items.groupingBy { it }.eachCount()
+                      for ((name, _) in counts) {
+                          if (name == "?") continue
+                          if (st(name) <= 0) continue
+                          if (name == "pizza" && now() < pizzaReadyAt) continue
+                          val locs = Cfg.SERVE[name] ?: continue
+                          if (!due("s$si$name", 1400L)) continue
+                          val c = Cfg.customer(Vision.SLOT_X[si])
+                          for (l in locs) acts.add(Act(l[0], l[1], c[0], c[1], true))
+                      }
+                  }
+                  if (acts.isNotEmpty()) go(acts.take(8), 150L)
+              }
+
+              private fun pizza() {
+                  if (now() < pizzaBusyUntil) return
+                  val acts = ArrayList<Act>()
+                  acts.add(tapA(Cfg.SAUSAGE))
+                  acts.add(tapA(Cfg.ONION))
+                  acts.add(tapA(Cfg.SAUSAGE))
+                  acts.add(tapA(Cfg.ONION))
+                  go(acts, 350L)
+                  Thread.sleep(500)
+                  go(listOf(tapA(Cfg.BASE1), tapA(Cfg.BASE2)), 350L)
+                  stock["pizza"] = st("pizza") + 2
+                  pizzaReadyAt = now() + 4500L
+                  pizzaBusyUntil = now() + 2500L
+              }
+
+              private fun burger(dem: Map<String, Int>, bmp: Bitmap) {
+                  val d = dem["burger"] ?: 0
+                  val gs = Cfg.GRILLS.map { Vision.grillState(bmp, it[0], it[1]) }
+                  if (bPhase == 0) {
+                      val need = minOf(4 - st("burger"), d - st("burger"))
+                      if (need > 0 && due("bstart", 2000L)) {
+                          val free = gs.count { it == 0 }
+                          val onGrill = gs.count { it != 0 }
+                          val raw = minOf(free, maxOf(0, need - onGrill))
+                          val acts = ArrayList<Act>()
+                          for (i in 0 until raw) acts.add(tapA(Cfg.PATTY))
+                          for (i in 0 until need) acts.add(tapA(Cfg.LETTUCE))
+                          for (i in 0 until need) acts.add(tapA(Cfg.TOMATO))
+                          go(acts, 300L)
+                          bPhase = 1
+                          bNeed = need
+                          bGot = 0
+                          bStart = now()
+                      }
+                  } else {
+                      val ready = ArrayList<IntArray>()
+                      for ((i, g) in Cfg.GRILLS.withIndex()) if (gs[i] == 2) ready.add(g)
+                      if (ready.isNotEmpty() && bGot < bNeed && due("grl", 900L)) {
+                          val take = ready.take(bNeed - bGot)
+                          go(take.map { tapA(it) }, 300L)
+                          bGot += take.size
+                      }
+                      if (bGot >= bNeed || now() - bStart > 25000L) {
+                          if (bGot > 0) {
+                              val acts = ArrayList<Act>()
+                              for (i in 0 until bGot) acts.add(tapA(Cfg.BUN))
+                              go(acts, 300L)
+                              stock["burger"] = st("burger") + bGot
+                          }
+                          bPhase = 0
                       }
                   }
               }
@@ -441,61 +580,50 @@ jobs:
                       Thread.sleep(400)
                       return
                   }
+                  frames++
                   val slots = Vision.SLOT_X.map { Vision.slotItems(bmp, it) }
-                  val need = HashSet<String>()
-                  for (s in slots) need.addAll(s)
+                  val dem = HashMap<String, Int>()
+                  for (s in slots) for (n in s) if (n != "?") dem[n] = (dem[n] ?: 0) + 1
+                  updateStock(dem)
+
                   val sb = StringBuilder()
                   for ((i, s) in slots.withIndex()) {
                       sb.append(i + 1).append(": ")
                       sb.append(if (s.isEmpty()) "-" else s.joinToString("+") { ru[it] ?: it })
                       sb.append("\n")
                   }
+                  sb.append("кадр ").append(frames)
                   if (!TapService.ready()) {
-                      ui(sb.toString() + "Включи службу спецвозможностей!")
+                      ui(sb.toString() + "\nВключи службу спецвозможностей!")
                       Thread.sleep(500)
                       return
                   }
-                  ui(sb.toString().trim())
-                  if (need.isEmpty()) {
+                  ui(sb.toString())
+                  if (dem.isEmpty() && bPhase == 0 && collectAt.isEmpty()) {
                       Thread.sleep(300)
                       return
                   }
 
-                  // 1. Подача готового блюда клиенту
-                  for ((si, items) in slots.withIndex()) {
-                      for (name in items.distinct()) {
-                          val locs = Cfg.SERVE[name] ?: continue
-                          if (due("s$si$name", 1100)) {
-                              val pts = ArrayList<IntArray>()
-                              for (l in locs.take(4)) {
-                                  pts.add(l)
-                                  pts.add(Cfg.p(Vision.SLOT_X[si], 330))
-                              }
-                              tap(pts)
-                          }
-                      }
-                  }
+                  // 1. Подача: готовое блюдо тянем к клиенту
+                  serve(slots)
 
-                  // 2. Приготовление нужного
-                  if ("cola" in need && due("cola", 3500)) tap(listOf(Cfg.COLA_M))
-                  if ("icecream" in need && due("ice", 3500)) tap(listOf(Cfg.ICE_M))
-                  if ("chicken" in need) cook("chk", listOf(Cfg.CHK_SRC), listOf(Cfg.FRY1), 5500)
-                  if ("fries" in need) cook("fry", listOf(Cfg.POT_SRC), listOf(Cfg.FRY2), 5500)
-                  if ("pizza" in need) {
-                      cook(
-                          "piz",
-                          listOf(Cfg.SAUSAGE, Cfg.ONION, Cfg.BASE1, Cfg.SAUSAGE, Cfg.ONION, Cfg.BASE2),
-                          Cfg.OVENS, 6000
-                      )
+                  // 2. Приготовление недостающего
+                  if ((dem["cola"] ?: 0) > st("cola") && due("cola", 3000L)) {
+                      go(listOf(tapA(Cfg.COLA_M)))
+                      stock["cola"] = 3
                   }
-                  if ("burger" in need) {
-                      val st = Cfg.GRILLS.map { Vision.grillState(bmp, it[0], it[1]) }
-                      if (st.any { it == 0 } && due("pat", 4000)) tap(listOf(Cfg.PATTY))
-                      val ready = ArrayList<IntArray>()
-                      for ((i, g) in Cfg.GRILLS.withIndex()) if (st[i] == 2) ready.add(g)
-                      if (ready.isNotEmpty() && due("grl", 900)) tap(ready)
-                      if (due("bun", 3500)) tap(listOf(Cfg.LETTUCE, Cfg.TOMATO, Cfg.BUN))
+                  if ((dem["icecream"] ?: 0) > st("icecream") && due("ice", 3000L)) {
+                      go(listOf(tapA(Cfg.ICE_M)))
+                      stock["icecream"] = 3
                   }
+                  if ((dem["chicken"] ?: 0) > st("chicken") || collectAt.containsKey("chk")) {
+                      cook("chk", "chicken", Cfg.CHK_SRC, Cfg.FRY1, 6500L)
+                  }
+                  if ((dem["fries"] ?: 0) > st("fries") || collectAt.containsKey("fry")) {
+                      cook("fry", "fries", Cfg.POT_SRC, Cfg.FRY2, 6500L)
+                  }
+                  if ((dem["pizza"] ?: 0) > st("pizza")) pizza()
+                  if ((dem["burger"] ?: 0) > st("burger") || bPhase != 0) burger(dem, bmp)
               }
           }
           EOF_12
