@@ -19,7 +19,7 @@ jobs:
           cat > bot/settings.gradle <<'EOF_0'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
-          rootProject.name = "MegaDrocher"
+          rootProject.name = "CookBot"
           include ':app'
           EOF_0
           mkdir -p bot
@@ -72,6 +72,7 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <activity android:name=".SettingsActivity" android:exported="false" />
                   <service android:name=".BotService" android:exported="false"
                       android:foregroundServiceType="mediaProjection" />
                   <service android:name=".TapService" android:exported="true"
@@ -99,7 +100,7 @@ jobs:
           cat > bot/app/src/main/res/values/strings.xml <<'EOF_6'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">Cook Bot</string>
+              <string name="app_name">MegaDrocher</string>
               <string name="desc">Нажатия на экран для автоигры</string>
           </resources>
           EOF_6
@@ -155,7 +156,7 @@ jobs:
               )
 
               // Куда тянуть блюдо: клиент стоит левее своего окошка заказа
-              fun customer(slotX: Int) = p(slotX - 220, 430)
+              fun customer(slotX: Int) = p(slotX - S.get("dropDx"), S.get("dropY"))
           }
           EOF_8
           mkdir -p bot/app/src/main/java/com/bot/cook
@@ -490,6 +491,7 @@ jobs:
 
           class TapService : AccessibilityService() {
               override fun onServiceConnected() {
+                  S.init(this)
                   inst = this
               }
 
@@ -518,9 +520,9 @@ jobs:
                           val dur: Long
                           if (a.drag) {
                               path.lineTo(a.x2 * sw / Vision.RW, a.y2 * sh / Vision.RH)
-                              dur = 280L
+                              dur = S.get("swipeDur").toLong()
                           } else {
-                              dur = 30L
+                              dur = S.get("tapDur").toLong()
                           }
                           b.addStroke(GestureDescription.StrokeDescription(path, t, dur))
                           t += dur + gap
@@ -545,7 +547,7 @@ jobs:
 
                   fun ready(): Boolean = inst != null
 
-                  fun run(acts: List<Act>, gap: Long = 120L) {
+                  fun run(acts: List<Act>, gap: Long = S.get("tapGap").toLong()) {
                       inst?.doRun(acts, gap)
                   }
               }
@@ -564,7 +566,9 @@ jobs:
               var running = true
               private val last = HashMap<String, Long>()
               private val collectAt = HashMap<String, Long>()
+              private val cookN = HashMap<String, Int>()
               private val seen = HashMap<String, Int>()
+              private val firstSeen = HashMap<String, Long>()
               private val usedAt = HashMap<String, Long>()
               private val sentAt = HashMap<String, ArrayList<Long>>()
               private val madeAt = HashMap<String, ArrayList<Long>>()
@@ -578,11 +582,16 @@ jobs:
               private var bBlock = 0L
               private var pizzaBusyUntil = 0L
 
-              // Сколько миллисекунд блюдо считается "уже заказано к готовке" (измерено по видео)
-              private val pend = mapOf(
-                  "cola" to 2400L, "icecream" to 2800L, "pizza" to 2600L,
-                  "chicken" to 2000L, "fries" to 2000L
-              )
+              // Сколько миллисекунд блюдо считается "уже поставлено готовиться"
+              private fun pend(dish: String): Long = when (dish) {
+                  "cola" -> 2400L
+                  "icecream" -> 2800L
+                  "pizza" -> S.get("pizzaMade").toLong()
+                  "chicken" -> 2000L
+                  "fries" -> 2000L
+                  else -> 2500L
+              }
+
               private val ru = mapOf(
                   "pizza" to "пицца", "burger" to "бургер", "cola" to "кола",
                   "icecream" to "мороженое", "fries" to "фри", "chicken" to "курица", "?" to "?"
@@ -618,14 +627,31 @@ jobs:
                   map.getOrPut(key) { ArrayList() }.add(now())
               }
 
-              private fun made(dish: String): Int = recent(madeAt, dish, pend[dish] ?: 2500L)
+              private fun made(dish: String): Int = recent(madeAt, dish, pend(dish))
 
               private fun haveOf(dish: String): Int = have[dish] ?: 0
 
               private fun tapA(p: IntArray) = Act(p[0], p[1], p[0], p[1], false)
 
-              private fun go(acts: List<Act>, gap: Long = 120L) {
+              private fun go(acts: List<Act>, gap: Long = S.get("tapGap").toLong()) {
                   if (acts.isNotEmpty()) TapService.run(acts, gap)
+              }
+
+              // Сколько штук блюда держать готовыми: заказы клиентов или запас из настроек (что больше), но не больше мест
+              private fun target(dish: String, dem: Map<String, Int>, active: Boolean): Int {
+                  val room = Cfg.SERVE[dish]?.size ?: 0
+                  val d = dem[dish] ?: 0
+                  val st = when (dish) {
+                      "burger" -> S.get("stBurger")
+                      "pizza" -> S.get("stPizza")
+                      "chicken" -> S.get("stChicken")
+                      "fries" -> S.get("stFries")
+                      "cola" -> S.get("stCola")
+                      "icecream" -> S.get("stIce")
+                      else -> 0
+                  }
+                  val t = if (active) maxOf(d, st) else d
+                  return minOf(t, room)
               }
 
               override fun run() {
@@ -636,7 +662,7 @@ jobs:
                           ui("Ошибка: " + e.toString())
                       }
                       try {
-                          Thread.sleep(150)
+                          Thread.sleep(S.get("loopMs").toLong())
                       } catch (e: InterruptedException) {
                           return
                       }
@@ -645,11 +671,8 @@ jobs:
 
               // Лежит ли на этой позиции готовое блюдо (по цвету в точке)
               private fun readyAt(dish: String, i: Int, p: IntArray, bmp: Bitmap): Boolean {
-                  val n = now()
                   return when (dish) {
                       "pizza" -> Vision.ovenReady(bmp, p[0], p[1])
-                      "cola" -> Vision.occupied(bmp, dish, i, p[0], p[1])
-                      "icecream" -> Vision.occupied(bmp, dish, i, p[0], p[1])
                       else -> Vision.occupied(bmp, dish, i, p[0], p[1])
                   }
               }
@@ -657,15 +680,24 @@ jobs:
               // Просматривает все позиции с готовыми блюдами. Блюдо считается готовым, если его видно на двух кадрах подряд.
               private fun scan(bmp: Bitmap): HashMap<String, ArrayList<Src>> {
                   val n = now()
+                  val delay = S.get("serveDelay").toLong()
                   val res = HashMap<String, ArrayList<Src>>()
                   have.clear()
                   for ((dish, locs) in Cfg.SERVE) {
                       for ((i, l) in locs.withIndex()) {
                           val key = dish + i
-                          if (readyAt(dish, i, l, bmp)) seen[key] = (seen[key] ?: 0) + 1 else seen[key] = 0
+                          if (readyAt(dish, i, l, bmp)) {
+                              val c = (seen[key] ?: 0) + 1
+                              seen[key] = c
+                              if (c == 1) firstSeen[key] = n
+                          } else {
+                              seen[key] = 0
+                              firstSeen.remove(key)
+                          }
                           if ((seen[key] ?: 0) >= 2) {
                               have[dish] = haveOf(dish) + 1
-                              if (n - (usedAt[key] ?: 0L) > 1500L && n - (tapAt[dish] ?: 0L) > 1200L) {
+                              val waited = n - (firstSeen[key] ?: n)
+                              if (n - (usedAt[key] ?: 0L) > 1500L && n - (tapAt[dish] ?: 0L) > 1200L && waited >= delay) {
                                   res.getOrPut(dish) { ArrayList() }.add(Src(key, l))
                               }
                           }
@@ -676,6 +708,8 @@ jobs:
 
               // Подача: тянем готовое блюдо только тем клиентам, которым оно ещё нужно
               private fun serve(slots: List<List<String>>, av: HashMap<String, ArrayList<Src>>) {
+                  if (S.get("serveOn") == 0) return
+                  val maxN = S.get("serveMax")
                   val acts = ArrayList<Act>()
                   val n = now()
                   for ((si, items) in slots.withIndex()) {
@@ -685,7 +719,7 @@ jobs:
                           val list = av[name] ?: continue
                           var need = cnt - recent(sentAt, "" + si + name, 2000L)
                           val c = Cfg.customer(Vision.SLOT_X[si])
-                          while (need > 0 && list.isNotEmpty() && acts.size < 6) {
+                          while (need > 0 && list.isNotEmpty() && acts.size < maxN) {
                               val s = list.removeAt(0)
                               usedAt[s.key] = n
                               mark(sentAt, "" + si + name)
@@ -694,20 +728,23 @@ jobs:
                           }
                       }
                   }
-                  if (acts.isNotEmpty()) go(acts, 100L)
+                  if (acts.isNotEmpty()) go(acts, S.get("serveGap").toLong())
               }
 
-              // Фритюрница: нажать источник, подождать, забрать на тарелку
+              // Фритюрница: быстро нажать источник нужное число раз, подождать, забрать на тарелки
               private fun cook(key: String, dish: String, src: IntArray, out: IntArray, cookMs: Long, want: Int) {
                   val c = collectAt[key]
                   if (c != null) {
                       if (now() >= c) {
-                          go(listOf(tapA(out)))
+                          val k = cookN[key] ?: 1
+                          go(List(k) { tapA(out) })
                           collectAt.remove(key)
-                          mark(madeAt, dish)
+                          for (i in 0 until k) mark(madeAt, dish)
                       }
                   } else if (want > 0 && due(key, 800L)) {
-                      go(listOf(tapA(src)))
+                      val k = minOf(want, 2)
+                      go(List(k) { tapA(src) })
+                      cookN[key] = k
                       collectAt[key] = now() + cookMs
                   }
               }
@@ -715,25 +752,25 @@ jobs:
               private fun pizza(count: Int) {
                   if (now() < pizzaBusyUntil) return
                   val n = minOf(count, 2)
+                  val pg = S.get("pizzaGap").toLong()
                   val acts = ArrayList<Act>()
                   for (i in 0 until n) {
                       acts.add(tapA(Cfg.SAUSAGE))
                       acts.add(tapA(Cfg.ONION))
                   }
-                  go(acts, 350L)
-                  Thread.sleep(500)
+                  go(acts, pg)
+                  Thread.sleep(400)
                   val bases = listOf(tapA(Cfg.BASE1), tapA(Cfg.BASE2))
-                  go(bases.take(n), 350L)
+                  go(bases.take(n), pg)
                   for (i in 0 until n) mark(madeAt, "pizza")
-                  pizzaBusyUntil = now() + 2000L
+                  pizzaBusyUntil = now() + S.get("pizzaRound").toLong()
               }
 
-              private fun burger(dem: Map<String, Int>, bmp: Bitmap) {
-                  val d = dem["burger"] ?: 0
+              private fun burger(tgt: Int, bmp: Bitmap) {
                   val hb = haveOf("burger")
                   val gs = Cfg.GRILLS.map { Vision.grillState(bmp, it[0], it[1]) }
                   if (bPhase == 0) {
-                      val need = minOf(4 - hb, d - hb)
+                      val need = minOf(4 - hb, tgt - hb)
                       if (now() > bBlock && need > 0 && due("bstart", 2000L)) {
                           val free = gs.count { it == 0 }
                           val onGrill = gs.count { it != 0 }
@@ -742,7 +779,7 @@ jobs:
                           for (i in 0 until raw) acts.add(tapA(Cfg.PATTY))
                           for (i in 0 until need) acts.add(tapA(Cfg.LETTUCE))
                           for (i in 0 until need) acts.add(tapA(Cfg.TOMATO))
-                          go(acts, 300L)
+                          go(acts)
                           bPhase = 1
                           bNeed = need
                           bGot = 0
@@ -753,14 +790,14 @@ jobs:
                       for ((i, g) in Cfg.GRILLS.withIndex()) if (gs[i] == 2) ready.add(g)
                       if (ready.isNotEmpty() && bGot < bNeed && due("grl", 900L)) {
                           val take = ready.take(bNeed - bGot)
-                          go(take.map { tapA(it) }, 300L)
+                          go(take.map { tapA(it) })
                           bGot += take.size
                       }
                       if (bGot >= bNeed || now() - bStart > 25000L) {
                           if (bGot > 0) {
                               val acts = ArrayList<Act>()
                               for (i in 0 until bGot) acts.add(tapA(Cfg.BUN))
-                              go(acts, 300L)
+                              go(acts)
                           }
                           bPhase = 0
                           bBlock = now() + 2500L
@@ -780,6 +817,7 @@ jobs:
                   val dem = HashMap<String, Int>()
                   for (s in slots) for (n in s) if (n != "?") dem[n] = (dem[n] ?: 0) + 1
                   val av = scan(bmp)
+                  val active = dem.isNotEmpty() || S.get("idle") == 1
 
                   val sb = StringBuilder()
                   for ((i, s) in slots.withIndex()) {
@@ -799,7 +837,7 @@ jobs:
                       return
                   }
                   ui(sb.toString())
-                  if (dem.isEmpty() && bPhase == 0 && collectAt.isEmpty()) {
+                  if (!active && bPhase == 0 && collectAt.isEmpty()) {
                       Thread.sleep(300)
                       return
                   }
@@ -807,26 +845,30 @@ jobs:
                   // 1. Подача: готовое блюдо тянем к клиенту
                   serve(slots, av)
 
-                  // 2. Приготовление недостающего (учитываем уже готовое и уже заказанное к готовке)
-                  val wCola = (dem["cola"] ?: 0) - haveOf("cola") - made("cola")
+                  // 2. Приготовление: держим в наличии max(заказы, запас) штук каждого блюда
+                  val wCola = target("cola", dem, active) - haveOf("cola") - made("cola")
                   if (wCola > 0 && due("cola", 700L)) {
-                      go(listOf(tapA(Cfg.COLA_M)))
+                      val k = minOf(wCola, 3)
+                      go(List(k) { tapA(Cfg.COLA_M) })
                       tapAt["cola"] = now()
-                      mark(madeAt, "cola")
+                      for (i in 0 until k) mark(madeAt, "cola")
                   }
-                  val wIce = (dem["icecream"] ?: 0) - haveOf("icecream") - made("icecream")
+                  val wIce = target("icecream", dem, active) - haveOf("icecream") - made("icecream")
                   if (wIce > 0 && due("ice", 700L)) {
-                      go(listOf(tapA(Cfg.ICE_M)))
+                      val k = minOf(wIce, 3)
+                      go(List(k) { tapA(Cfg.ICE_M) })
                       tapAt["icecream"] = now()
-                      mark(madeAt, "icecream")
+                      for (i in 0 until k) mark(madeAt, "icecream")
                   }
-                  val wChk = (dem["chicken"] ?: 0) - haveOf("chicken") - made("chicken")
-                  cook("chk", "chicken", Cfg.CHK_SRC, Cfg.FRY1, 3500L, wChk)
-                  val wFry = (dem["fries"] ?: 0) - haveOf("fries") - made("fries")
-                  cook("fry", "fries", Cfg.POT_SRC, Cfg.FRY2, 3500L, wFry)
-                  val wPiz = (dem["pizza"] ?: 0) - haveOf("pizza") - made("pizza")
+                  val fry = S.get("fryMs").toLong()
+                  val wChk = target("chicken", dem, active) - haveOf("chicken") - made("chicken")
+                  cook("chk", "chicken", Cfg.CHK_SRC, Cfg.FRY1, fry, wChk)
+                  val wFry = target("fries", dem, active) - haveOf("fries") - made("fries")
+                  cook("fry", "fries", Cfg.POT_SRC, Cfg.FRY2, fry, wFry)
+                  val wPiz = target("pizza", dem, active) - haveOf("pizza") - made("pizza")
                   if (wPiz > 0) pizza(wPiz)
-                  if ((dem["burger"] ?: 0) > haveOf("burger") || bPhase != 0) burger(dem, bmp)
+                  val tBur = target("burger", dem, active)
+                  if (tBur > haveOf("burger") || bPhase != 0) burger(tBur, bmp)
               }
           }
           EOF_12
@@ -877,6 +919,7 @@ jobs:
               @Suppress("DEPRECATION")
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent == null) return START_NOT_STICKY
+                  S.init(this)
                   val ch = "cookbot"
                   val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                   nm.createNotificationChannel(NotificationChannel(ch, "Cook Bot", NotificationManager.IMPORTANCE_LOW))
@@ -1039,6 +1082,9 @@ jobs:
                   add("2. Включить службу спецвозможностей") {
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   }
+                  add("Настройки скорости, подачи и запаса") {
+                      startActivity(Intent(this, SettingsActivity::class.java))
+                  }
                   add("3. Запустить бота") {
                       val m = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                       startActivityForResult(m.createScreenCaptureIntent(), 7)
@@ -1061,9 +1107,206 @@ jobs:
               }
           }
           EOF_14
+          cat > bot/app/src/main/java/com/bot/cook/Settings.kt <<'EOF_16'
+          package com.bot.cook
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import java.util.concurrent.ConcurrentHashMap
+
+          // Одна настройка: ключ, раздел, название, значение по умолчанию, диапазон, шаг, единица, подсказка
+          class Opt(
+              val key: String,
+              val group: String,
+              val title: String,
+              val def: Int,
+              val min: Int,
+              val max: Int,
+              val step: Int,
+              val unit: String,
+              val hint: String
+          )
+
+          object S {
+              val ALL: List<Opt> = listOf(
+                  Opt("tapGap", "Скорость готовки", "Пауза между кликами", 150, 20, 600, 10, "мс", "Меньше - быстрее. Если игра пропускает клики, увеличь."),
+                  Opt("pizzaGap", "Скорость готовки", "Пауза между кликами по начинке пиццы", 300, 50, 800, 10, "мс", "Колбаса и лук. Слишком быстро - начинка ляжет не на ту основу."),
+                  Opt("tapDur", "Скорость готовки", "Длительность одного клика", 30, 10, 200, 5, "мс", "Как долго палец держится на экране."),
+                  Opt("swipeDur", "Скорость готовки", "Длительность свайпа", 280, 60, 900, 10, "мс", "Меньше - свайп быстрее. Слишком быстрый игра может не принять."),
+                  Opt("loopMs", "Скорость готовки", "Пауза между шагами бота", 150, 50, 1000, 10, "мс", "Как часто бот смотрит на экран и принимает решения."),
+                  Opt("serveOn", "Подача клиентам", "Подавать блюда клиентам", 1, 0, 1, 1, "onoff", "Выключи, чтобы бот только готовил, а отдавал ты сам."),
+                  Opt("serveDelay", "Подача клиентам", "Задержка перед подачей", 0, 0, 5000, 100, "мс", "Сколько блюдо должно полежать готовым, прежде чем бот его отдаст."),
+                  Opt("serveGap", "Подача клиентам", "Пауза между свайпами при подаче", 100, 20, 800, 10, "мс", ""),
+                  Opt("serveMax", "Подача клиентам", "Макс. свайпов за раз", 6, 1, 8, 1, "шт", "Сколько блюд бот отдаёт за один заход."),
+                  Opt("dropDx", "Подача клиентам", "Точка сброса: сдвиг влево от окошка заказа", 220, 0, 400, 10, "px", "Если блюдо не доходит до клиента, меняй это и высоту."),
+                  Opt("dropY", "Подача клиентам", "Точка сброса: высота", 430, 250, 600, 10, "px", "Больше - ниже на экране."),
+                  Opt("idle", "Запас (готовить заранее)", "Готовить запас, когда нет заказов", 0, 0, 1, 1, "onoff", "Выкл: запас готовится, только пока есть хотя бы один заказ."),
+                  Opt("stBurger", "Запас (готовить заранее)", "Бургеры в запасе", 4, 0, 4, 1, "шт", "Сколько бургеров держать готовыми. 0 - только под заказ."),
+                  Opt("stPizza", "Запас (готовить заранее)", "Пиццы в запасе", 3, 0, 3, 1, "шт", "Печь вмещает 3."),
+                  Opt("stChicken", "Запас (готовить заранее)", "Курица в запасе", 2, 0, 2, 1, "шт", ""),
+                  Opt("stFries", "Запас (готовить заранее)", "Фри в запасе", 2, 0, 2, 1, "шт", ""),
+                  Opt("stCola", "Запас (готовить заранее)", "Кола в запасе", 3, 0, 3, 1, "шт", ""),
+                  Opt("stIce", "Запас (готовить заранее)", "Мороженое в запасе", 3, 0, 3, 1, "шт", ""),
+                  Opt("fryMs", "Время готовки", "Время жарки фри и курицы", 3500, 1000, 9000, 250, "мс", "Через столько бот забирает еду из фритюрницы."),
+                  Opt("pizzaRound", "Время готовки", "Пауза между партиями пиццы", 1500, 300, 4000, 100, "мс", "Пока в игре появятся новые основы."),
+                  Opt("pizzaMade", "Время готовки", "Время выпечки пиццы", 5000, 2000, 10000, 250, "мс", "Столько бот считает пиццу «ещё печётся» и не печёт лишнюю.")
+              )
+
+              @Volatile
+              private var sp: SharedPreferences? = null
+              private val cache = ConcurrentHashMap<String, Int>()
+
+              fun init(c: Context) {
+                  if (sp == null) sp = c.applicationContext.getSharedPreferences("cookbot", Context.MODE_PRIVATE)
+              }
+
+              fun get(key: String): Int {
+                  val c = cache[key]
+                  if (c != null) return c
+                  val o = ALL.firstOrNull { it.key == key } ?: return 0
+                  val s = sp
+                  if (s == null) return o.def
+                  val v = s.getInt(key, o.def)
+                  cache[key] = v
+                  return v
+              }
+
+              fun set(key: String, v: Int) {
+                  cache[key] = v
+                  sp?.edit()?.putInt(key, v)?.apply()
+              }
+
+              fun reset() {
+                  cache.clear()
+                  val e = sp?.edit()
+                  if (e != null) {
+                      e.clear()
+                      e.apply()
+                  }
+              }
+
+              fun text(o: Opt, v: Int): String =
+                  if (o.unit == "onoff") (if (v == 1) "вкл" else "выкл") else v.toString() + " " + o.unit
+          }
+          EOF_16
+          cat > bot/app/src/main/java/com/bot/cook/SettingsActivity.kt <<'EOF_17'
+          package com.bot.cook
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+
+          class SettingsActivity : Activity() {
+              private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  S.init(this)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(40), dp(16), dp(24))
+                  val title = TextView(this)
+                  title.text = "Настройки бота (действуют сразу, даже когда бот работает)"
+                  title.textSize = 18f
+                  title.setTypeface(null, Typeface.BOLD)
+                  root.addView(title)
+                  var group = ""
+                  for (o in S.ALL) {
+                      if (o.group != group) {
+                          group = o.group
+                          val h = TextView(this)
+                          h.text = group
+                          h.textSize = 16f
+                          h.setTypeface(null, Typeface.BOLD)
+                          h.setTextColor(Color.rgb(30, 80, 160))
+                          h.setPadding(0, dp(22), 0, dp(4))
+                          root.addView(h)
+                      }
+                      addRow(root, o)
+                  }
+                  val reset = Button(this)
+                  reset.text = "Сбросить всё по умолчанию"
+                  reset.setOnClickListener {
+                      S.reset()
+                      recreate()
+                  }
+                  root.addView(reset)
+                  val back = Button(this)
+                  back.text = "Назад"
+                  back.setOnClickListener { finish() }
+                  root.addView(back)
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              private fun addRow(root: LinearLayout, o: Opt) {
+                  val head = LinearLayout(this)
+                  head.orientation = LinearLayout.HORIZONTAL
+                  head.setPadding(0, dp(12), 0, 0)
+                  val name = TextView(this)
+                  name.text = o.title
+                  name.textSize = 14f
+                  head.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  val value = TextView(this)
+                  value.textSize = 16f
+                  value.setTypeface(null, Typeface.BOLD)
+                  value.setTextColor(Color.rgb(200, 60, 0))
+                  head.addView(value)
+                  root.addView(head)
+                  if (o.hint.isNotEmpty()) {
+                      val hint = TextView(this)
+                      hint.text = o.hint
+                      hint.textSize = 11f
+                      hint.setTextColor(Color.GRAY)
+                      root.addView(hint)
+                  }
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+                  val minus = Button(this)
+                  minus.text = "-"
+                  minus.minWidth = 0
+                  minus.minimumWidth = 0
+                  val plus = Button(this)
+                  plus.text = "+"
+                  plus.minWidth = 0
+                  plus.minimumWidth = 0
+                  val sb = SeekBar(this)
+                  sb.max = (o.max - o.min) / o.step
+                  val cur = S.get(o.key).coerceIn(o.min, o.max)
+                  sb.progress = (cur - o.min) / o.step
+                  value.text = S.text(o, cur)
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          val v = o.min + p * o.step
+                          S.set(o.key, v)
+                          value.text = S.text(o, v)
+                      }
+
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  minus.setOnClickListener { sb.progress = maxOf(0, sb.progress - 1) }
+                  plus.setOnClickListener { sb.progress = minOf(sb.max, sb.progress + 1) }
+                  row.addView(minus, LinearLayout.LayoutParams(dp(52), dp(48)))
+                  row.addView(sb, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(plus, LinearLayout.LayoutParams(dp(52), dp(48)))
+                  root.addView(row)
+              }
+          }
+          EOF_17
       - name: Build
         run: gradle assembleDebug --no-daemon -p bot
       - uses: actions/upload-artifact@v4
         with:
-          name: MegaDrocher-apk
+          name: CookBot-apk
           path: bot/app/build/outputs/apk/debug/app-debug.apk
