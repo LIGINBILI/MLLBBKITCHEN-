@@ -91,6 +91,7 @@ jobs:
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
               android:description="@string/desc"
               android:notificationTimeout="100" />
           EOF_5
@@ -240,7 +241,7 @@ jobs:
                               best = name
                           }
                       }
-                      res.add(if (bd > 45) "?" else best)
+                      res.add(if (bd > 25) "?" else best)
                   }
                   return res
               }
@@ -264,6 +265,46 @@ jobs:
                   if (r > 200 && r - g > 70 && b > 90) return 1
                   return 0
               }
+
+              private fun avg(bmp: Bitmap, x: Int, y: Int, hx: Int, hy: Int): IntArray {
+                  val w = 2 * hx + 1
+                  val h = 2 * hy + 1
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, x - hx, y - hy, w, h)
+                  var r = 0
+                  var g = 0
+                  var b = 0
+                  for (c in px) {
+                      r += (c shr 16) and 255
+                      g += (c shr 8) and 255
+                      b += c and 255
+                  }
+                  return intArrayOf(r / px.size, g / px.size, b / px.size)
+              }
+
+              // Цвета пустых мест у автоматов колы и мороженого (из видео)
+              private val COLA_BASE = arrayOf(intArrayOf(192, 89, 98), intArrayOf(164, 108, 128), intArrayOf(198, 82, 60))
+              private val ICE_BASE = arrayOf(intArrayOf(209, 110, 12), intArrayOf(182, 111, 28), intArrayOf(182, 80, 5))
+
+              private fun dist(c: IntArray, t: IntArray): Int = abs(c[0] - t[0]) + abs(c[1] - t[1]) + abs(c[2] - t[2])
+
+              // Лежит ли готовое блюдо на этой позиции (тарелка, коробка фри, стакан, рожок)
+              fun occupied(bmp: Bitmap, dish: String, i: Int, x: Int, y: Int): Boolean {
+                  val c = avg(bmp, x, y, 10, 10)
+                  return when (dish) {
+                      "chicken", "fries" -> c[0] - c[2] > 20
+                      "burger" -> c[0] in 140..180 && c[1] in 60..100 && c[2] < 35
+                      "cola" -> dist(c, COLA_BASE[minOf(i, 2)]) > 40
+                      "icecream" -> dist(c, ICE_BASE[minOf(i, 2)]) > 40
+                      else -> false
+                  }
+              }
+
+              // Пицца в слоте печи готова: оранжевая. Пустой слот серо-фиолетовый, выпекающийся розовый.
+              fun ovenReady(bmp: Bitmap, x: Int, y: Int): Boolean {
+                  val c = avg(bmp, x, y, 28, 11)
+                  return c[0] > 235 && c[1] > 170 && c[2] < c[1] - 25
+              }
           }
           EOF_9
           mkdir -p bot/app/src/main/java/com/bot/cook
@@ -280,7 +321,7 @@ jobs:
           import android.media.ImageReader
           import android.media.projection.MediaProjection
 
-          class Capture(proj: MediaProjection, private val w: Int, private val h: Int, dpi: Int) {
+          class Capture(proj: MediaProjection, private val w: Int, private val h: Int, dpi: Int) : Frames {
               private val reader: ImageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
               private val vd: VirtualDisplay = proj.createVirtualDisplay(
                   "cookbot", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, null
@@ -293,9 +334,10 @@ jobs:
               private val dst = Rect(0, 0, Vision.RW, Vision.RH)
               private var raw: Bitmap? = null
               private var have = false
+              private var fresh = 0
 
               // Последний кадр, приведённый к размеру 2576x1159
-              fun frame(): Bitmap? {
+              override fun frame(): Bitmap? {
                   val img = reader.acquireLatestImage()
                   if (img != null) {
                       try {
@@ -310,6 +352,7 @@ jobs:
                           bm.copyPixelsFromBuffer(p.buffer)
                           canvas.drawBitmap(bm, src, dst, paint)
                           have = true
+                          fresh++
                       } finally {
                           img.close()
                       }
@@ -317,12 +360,114 @@ jobs:
                   return if (have) out else null
               }
 
+              override fun info(): String = "MP new=" + fresh + " " + w + "x" + h
+
               fun release() {
                   vd.release()
                   reader.close()
               }
           }
           EOF_10
+          cat > bot/app/src/main/java/com/bot/cook/ShotCapture.kt <<'EOF_15'
+          package com.bot.cook
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.Rect
+          import android.os.Build
+          import android.view.Display
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+
+          interface Frames {
+              fun frame(): Bitmap?
+              fun info(): String
+          }
+
+          // Кадры через скриншот службы спецвозможностей (Android 11+)
+          class ShotCapture : Frames {
+              private val exec = Executors.newSingleThreadExecutor()
+              private val out: Bitmap = Bitmap.createBitmap(Vision.RW, Vision.RH, Bitmap.Config.ARGB_8888)
+              private val canvas = Canvas(out)
+              private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+              private val dst = Rect(0, 0, Vision.RW, Vision.RH)
+              private var lastReq = 0L
+              private var have = false
+              private var ok = 0
+              private var fails = 0
+              private var failRun = 0
+              private var lastErr = 0
+              private var size = "-"
+
+              fun usable(): Boolean = Build.SDK_INT >= 30 && failRun < 5
+
+              override fun info(): String = "SHOT ok=" + ok + " err=" + fails + "(" + lastErr + ") " + size
+
+              override fun frame(): Bitmap? {
+                  if (Build.SDK_INT < 30) return null
+                  val svc = TapService.inst ?: return null
+                  val wait = 350L - (System.currentTimeMillis() - lastReq)
+                  if (wait > 0) Thread.sleep(wait)
+                  lastReq = System.currentTimeMillis()
+                  val latch = CountDownLatch(1)
+                  var got: Bitmap? = null
+                  var code = 0
+                  svc.takeScreenshot(Display.DEFAULT_DISPLAY, exec, object : AccessibilityService.TakeScreenshotCallback {
+                      override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                          try {
+                              val hb = r.hardwareBuffer
+                              val hw = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)
+                              if (hw != null) {
+                                  got = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                  hw.recycle()
+                              }
+                              hb.close()
+                          } catch (e: Throwable) {
+                              code = -1
+                          }
+                          latch.countDown()
+                      }
+
+                      override fun onFailure(errorCode: Int) {
+                          code = errorCode
+                          latch.countDown()
+                      }
+                  })
+                  if (!latch.await(1500, TimeUnit.MILLISECONDS)) code = -2
+                  val b = got
+                  if (b == null) {
+                      fails++
+                      failRun++
+                      lastErr = if (code != 0) code else -3
+                      return if (have && usable()) out else null
+                  }
+                  size = b.width.toString() + "x" + b.height
+                  canvas.drawBitmap(b, Rect(0, 0, b.width, b.height), dst, paint)
+                  b.recycle()
+                  ok++
+                  failRun = 0
+                  have = true
+                  return out
+              }
+          }
+
+          // Сначала скриншоты; если они не работают - запись экрана (MediaProjection)
+          class AutoFrames(private val shot: ShotCapture, private val mp: Capture?) : Frames {
+              override fun frame(): Bitmap? {
+                  if (shot.usable()) {
+                      val b = shot.frame()
+                      if (b != null) return b
+                  }
+                  return mp?.frame()
+              }
+
+              override fun info(): String =
+                  if (shot.usable()) shot.info() else (mp?.info() ?: "нет захвата") + " | " + shot.info()
+          }
+          EOF_15
           mkdir -p bot/app/src/main/java/com/bot/cook
           cat > bot/app/src/main/java/com/bot/cook/TapService.kt <<'EOF_11'
           package com.bot.cook
@@ -412,22 +557,32 @@ jobs:
 
           import android.graphics.Bitmap
 
-          class Engine(private val cap: Capture, private val ui: (String) -> Unit) : Thread() {
+          class Src(val key: String, val p: IntArray)
+
+          class Engine(private val cap: Frames, private val ui: (String) -> Unit) : Thread() {
               @Volatile
               var running = true
               private val last = HashMap<String, Long>()
               private val collectAt = HashMap<String, Long>()
-              private val stock = HashMap<String, Int>()
-              private val prevDem = HashMap<String, Int>()
-              private val changedAt = HashMap<String, Long>()
+              private val seen = HashMap<String, Int>()
+              private val usedAt = HashMap<String, Long>()
+              private val sentAt = HashMap<String, ArrayList<Long>>()
+              private val madeAt = HashMap<String, ArrayList<Long>>()
+              private val tapAt = HashMap<String, Long>()
+              private val have = HashMap<String, Int>()
               private var frames = 0
               private var bPhase = 0
               private var bNeed = 0
               private var bGot = 0
               private var bStart = 0L
-              private var pizzaReadyAt = 0L
+              private var bBlock = 0L
               private var pizzaBusyUntil = 0L
-              private val dishes = listOf("cola", "icecream", "chicken", "fries", "pizza", "burger")
+
+              // Сколько миллисекунд блюдо считается "уже заказано к готовке" (измерено по видео)
+              private val pend = mapOf(
+                  "cola" to 2400L, "icecream" to 2800L, "pizza" to 2600L,
+                  "chicken" to 2000L, "fries" to 2000L
+              )
               private val ru = mapOf(
                   "pizza" to "пицца", "burger" to "бургер", "cola" to "кола",
                   "icecream" to "мороженое", "fries" to "фри", "chicken" to "курица", "?" to "?"
@@ -435,7 +590,12 @@ jobs:
 
               private fun now() = System.currentTimeMillis()
 
-              private fun st(k: String): Int = stock[k] ?: 0
+              // Короткая подпись кадра: если она не меняется, кадр завис
+              private fun sig(b: Bitmap): Int {
+                  var h = 17
+                  for (i in 1..8) for (j in 1..4) h = h * 31 + b.getPixel(b.width * i / 9, b.height * j / 5)
+                  return h
+              }
 
               private fun due(k: String, ms: Long): Boolean {
                   val n = now()
@@ -446,6 +606,21 @@ jobs:
                   }
                   return false
               }
+
+              private fun recent(map: HashMap<String, ArrayList<Long>>, key: String, ms: Long): Int {
+                  val l = map[key] ?: return 0
+                  val n = now()
+                  l.removeAll { n - it > ms }
+                  return l.size
+              }
+
+              private fun mark(map: HashMap<String, ArrayList<Long>>, key: String) {
+                  map.getOrPut(key) { ArrayList() }.add(now())
+              }
+
+              private fun made(dish: String): Int = recent(madeAt, dish, pend[dish] ?: 2500L)
+
+              private fun haveOf(dish: String): Int = have[dish] ?: 0
 
               private fun tapA(p: IntArray) = Act(p[0], p[1], p[0], p[1], false)
 
@@ -468,78 +643,98 @@ jobs:
                   }
               }
 
-              // Следим за тем, сколько готовых блюд лежит: заказ ушёл - значит блюдо отдано
-              private fun updateStock(dem: Map<String, Int>) {
+              // Лежит ли на этой позиции готовое блюдо (по цвету в точке)
+              private fun readyAt(dish: String, i: Int, p: IntArray, bmp: Bitmap): Boolean {
                   val n = now()
-                  for (k in dishes) {
-                      val cur = dem[k] ?: 0
-                      val prev = prevDem[k] ?: 0
-                      if (cur < prev) stock[k] = maxOf(0, st(k) - (prev - cur))
-                      if (cur != prev) changedAt[k] = n
-                      val ch = changedAt[k] ?: n
-                      changedAt[k] = ch
-                      // Заказ не меняется давно, а мы думаем, что блюдо готово: значит оценка неверна
-                      if (cur > 0 && st(k) >= cur && n - ch > 14000L) {
-                          stock[k] = 0
-                          changedAt[k] = n
-                      }
-                      prevDem[k] = cur
+                  return when (dish) {
+                      "pizza" -> Vision.ovenReady(bmp, p[0], p[1])
+                      "cola" -> n - (tapAt["cola"] ?: 0L) > 1900L && Vision.occupied(bmp, dish, i, p[0], p[1])
+                      "icecream" -> n - (tapAt["icecream"] ?: 0L) > 2300L && Vision.occupied(bmp, dish, i, p[0], p[1])
+                      else -> Vision.occupied(bmp, dish, i, p[0], p[1])
                   }
               }
 
-              // Приготовление в фритюрнице: нажать источник, подождать, забрать
-              private fun cook(key: String, dish: String, src: IntArray, out: IntArray, cookMs: Long) {
+              // Просматривает все позиции с готовыми блюдами. Блюдо считается готовым, если его видно на двух кадрах подряд.
+              private fun scan(bmp: Bitmap): HashMap<String, ArrayList<Src>> {
+                  val n = now()
+                  val res = HashMap<String, ArrayList<Src>>()
+                  have.clear()
+                  for ((dish, locs) in Cfg.SERVE) {
+                      for ((i, l) in locs.withIndex()) {
+                          val key = dish + i
+                          if (readyAt(dish, i, l, bmp)) seen[key] = (seen[key] ?: 0) + 1 else seen[key] = 0
+                          if ((seen[key] ?: 0) >= 2) {
+                              have[dish] = haveOf(dish) + 1
+                              if (n - (usedAt[key] ?: 0L) > 1500L) {
+                                  res.getOrPut(dish) { ArrayList() }.add(Src(key, l))
+                              }
+                          }
+                      }
+                  }
+                  return res
+              }
+
+              // Подача: тянем готовое блюдо только тем клиентам, которым оно ещё нужно
+              private fun serve(slots: List<List<String>>, av: HashMap<String, ArrayList<Src>>) {
+                  val acts = ArrayList<Act>()
+                  val n = now()
+                  for ((si, items) in slots.withIndex()) {
+                      val counts = items.groupingBy { it }.eachCount()
+                      for ((name, cnt) in counts) {
+                          if (name == "?") continue
+                          val list = av[name] ?: continue
+                          var need = cnt - recent(sentAt, "" + si + name, 2000L)
+                          val c = Cfg.customer(Vision.SLOT_X[si])
+                          while (need > 0 && list.isNotEmpty() && acts.size < 6) {
+                              val s = list.removeAt(0)
+                              usedAt[s.key] = n
+                              mark(sentAt, "" + si + name)
+                              acts.add(Act(s.p[0], s.p[1], c[0], c[1], true))
+                              need--
+                          }
+                      }
+                  }
+                  if (acts.isNotEmpty()) go(acts, 100L)
+              }
+
+              // Фритюрница: нажать источник, подождать, забрать на тарелку
+              private fun cook(key: String, dish: String, src: IntArray, out: IntArray, cookMs: Long, want: Int) {
                   val c = collectAt[key]
                   if (c != null) {
                       if (now() >= c) {
                           go(listOf(tapA(out)))
                           collectAt.remove(key)
-                          stock[dish] = st(dish) + 1
+                          mark(madeAt, dish)
                       }
-                  } else if (due(key, 1500L)) {
+                  } else if (want > 0 && due(key, 800L)) {
                       go(listOf(tapA(src)))
                       collectAt[key] = now() + cookMs
                   }
               }
 
-              private fun serve(slots: List<List<String>>) {
-                  val acts = ArrayList<Act>()
-                  for ((si, items) in slots.withIndex()) {
-                      val counts = items.groupingBy { it }.eachCount()
-                      for ((name, _) in counts) {
-                          if (name == "?") continue
-                          if (st(name) <= 0) continue
-                          if (name == "pizza" && now() < pizzaReadyAt) continue
-                          val locs = Cfg.SERVE[name] ?: continue
-                          if (!due("s$si$name", 1400L)) continue
-                          val c = Cfg.customer(Vision.SLOT_X[si])
-                          for (l in locs) acts.add(Act(l[0], l[1], c[0], c[1], true))
-                      }
-                  }
-                  if (acts.isNotEmpty()) go(acts.take(8), 150L)
-              }
-
-              private fun pizza() {
+              private fun pizza(count: Int) {
                   if (now() < pizzaBusyUntil) return
+                  val n = minOf(count, 2)
                   val acts = ArrayList<Act>()
-                  acts.add(tapA(Cfg.SAUSAGE))
-                  acts.add(tapA(Cfg.ONION))
-                  acts.add(tapA(Cfg.SAUSAGE))
-                  acts.add(tapA(Cfg.ONION))
+                  for (i in 0 until n) {
+                      acts.add(tapA(Cfg.SAUSAGE))
+                      acts.add(tapA(Cfg.ONION))
+                  }
                   go(acts, 350L)
                   Thread.sleep(500)
-                  go(listOf(tapA(Cfg.BASE1), tapA(Cfg.BASE2)), 350L)
-                  stock["pizza"] = st("pizza") + 2
-                  pizzaReadyAt = now() + 4500L
-                  pizzaBusyUntil = now() + 2500L
+                  val bases = listOf(tapA(Cfg.BASE1), tapA(Cfg.BASE2))
+                  go(bases.take(n), 350L)
+                  for (i in 0 until n) mark(madeAt, "pizza")
+                  pizzaBusyUntil = now() + 2000L
               }
 
               private fun burger(dem: Map<String, Int>, bmp: Bitmap) {
                   val d = dem["burger"] ?: 0
+                  val hb = haveOf("burger")
                   val gs = Cfg.GRILLS.map { Vision.grillState(bmp, it[0], it[1]) }
                   if (bPhase == 0) {
-                      val need = minOf(4 - st("burger"), d - st("burger"))
-                      if (need > 0 && due("bstart", 2000L)) {
+                      val need = minOf(4 - hb, d - hb)
+                      if (now() > bBlock && need > 0 && due("bstart", 2000L)) {
                           val free = gs.count { it == 0 }
                           val onGrill = gs.count { it != 0 }
                           val raw = minOf(free, maxOf(0, need - onGrill))
@@ -566,9 +761,9 @@ jobs:
                               val acts = ArrayList<Act>()
                               for (i in 0 until bGot) acts.add(tapA(Cfg.BUN))
                               go(acts, 300L)
-                              stock["burger"] = st("burger") + bGot
                           }
                           bPhase = 0
+                          bBlock = now() + 2500L
                       }
                   }
               }
@@ -584,7 +779,7 @@ jobs:
                   val slots = Vision.SLOT_X.map { Vision.slotItems(bmp, it) }
                   val dem = HashMap<String, Int>()
                   for (s in slots) for (n in s) if (n != "?") dem[n] = (dem[n] ?: 0) + 1
-                  updateStock(dem)
+                  val av = scan(bmp)
 
                   val sb = StringBuilder()
                   for ((i, s) in slots.withIndex()) {
@@ -592,7 +787,12 @@ jobs:
                       sb.append(if (s.isEmpty()) "-" else s.joinToString("+") { ru[it] ?: it })
                       sb.append("\n")
                   }
-                  sb.append("кадр ").append(frames)
+                  sb.append("готово: ")
+                  val hv = have.entries.filter { it.value > 0 }
+                  sb.append(if (hv.isEmpty()) "-" else hv.joinToString(" ") { (ru[it.key] ?: it.key) + it.value })
+                  sb.append("\n")
+                  sb.append("кадр ").append(frames).append("\n")
+                  sb.append(cap.info()).append(" sig=").append(Integer.toHexString(sig(bmp)).takeLast(5))
                   if (!TapService.ready()) {
                       ui(sb.toString() + "\nВключи службу спецвозможностей!")
                       Thread.sleep(500)
@@ -605,25 +805,28 @@ jobs:
                   }
 
                   // 1. Подача: готовое блюдо тянем к клиенту
-                  serve(slots)
+                  serve(slots, av)
 
-                  // 2. Приготовление недостающего
-                  if ((dem["cola"] ?: 0) > st("cola") && due("cola", 3000L)) {
+                  // 2. Приготовление недостающего (учитываем уже готовое и уже заказанное к готовке)
+                  val wCola = (dem["cola"] ?: 0) - haveOf("cola") - made("cola")
+                  if (wCola > 0 && due("cola", 700L)) {
                       go(listOf(tapA(Cfg.COLA_M)))
-                      stock["cola"] = 3
+                      tapAt["cola"] = now()
+                      mark(madeAt, "cola")
                   }
-                  if ((dem["icecream"] ?: 0) > st("icecream") && due("ice", 3000L)) {
+                  val wIce = (dem["icecream"] ?: 0) - haveOf("icecream") - made("icecream")
+                  if (wIce > 0 && due("ice", 700L)) {
                       go(listOf(tapA(Cfg.ICE_M)))
-                      stock["icecream"] = 3
+                      tapAt["icecream"] = now()
+                      mark(madeAt, "icecream")
                   }
-                  if ((dem["chicken"] ?: 0) > st("chicken") || collectAt.containsKey("chk")) {
-                      cook("chk", "chicken", Cfg.CHK_SRC, Cfg.FRY1, 6500L)
-                  }
-                  if ((dem["fries"] ?: 0) > st("fries") || collectAt.containsKey("fry")) {
-                      cook("fry", "fries", Cfg.POT_SRC, Cfg.FRY2, 6500L)
-                  }
-                  if ((dem["pizza"] ?: 0) > st("pizza")) pizza()
-                  if ((dem["burger"] ?: 0) > st("burger") || bPhase != 0) burger(dem, bmp)
+                  val wChk = (dem["chicken"] ?: 0) - haveOf("chicken") - made("chicken")
+                  cook("chk", "chicken", Cfg.CHK_SRC, Cfg.FRY1, 3500L, wChk)
+                  val wFry = (dem["fries"] ?: 0) - haveOf("fries") - made("fries")
+                  cook("fry", "fries", Cfg.POT_SRC, Cfg.FRY2, 3500L, wFry)
+                  val wPiz = (dem["pizza"] ?: 0) - haveOf("pizza") - made("pizza")
+                  if (wPiz > 0) pizza(wPiz)
+                  if ((dem["burger"] ?: 0) > haveOf("burger") || bPhase != 0) burger(dem, bmp)
               }
           }
           EOF_12
@@ -658,6 +861,7 @@ jobs:
           class BotService : Service() {
               private var proj: MediaProjection? = null
               private var cap: Capture? = null
+              private var frames: Frames? = null
               private var engine: Engine? = null
               private var wm: WindowManager? = null
               private var panel: LinearLayout? = null
@@ -696,6 +900,7 @@ jobs:
                   val dm = DisplayMetrics()
                   (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
                   cap = Capture(p, max(dm.widthPixels, dm.heightPixels), min(dm.widthPixels, dm.heightPixels), dm.densityDpi)
+                  frames = AutoFrames(ShotCapture(), cap)
                   showPanel()
                   return START_NOT_STICKY
               }
@@ -727,7 +932,7 @@ jobs:
                           engine = null
                           btn.text = "СТАРТ"
                       } else {
-                          val c = cap
+                          val c = frames
                           if (c != null) {
                               val ne = Engine(c) { s -> main.post { tv.text = s } }
                               engine = ne
