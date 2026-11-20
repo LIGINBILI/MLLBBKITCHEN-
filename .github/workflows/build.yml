@@ -402,12 +402,12 @@ jobs:
               private var lastErr = 0
               private var size = "-"
 
-              fun usable(): Boolean = Build.SDK_INT >= 30 && failRun < 5
+              fun usable(): Boolean = Build.VERSION.SDK_INT >= 30 && failRun < 5
 
               override fun info(): String = "SHOT ok=" + ok + " err=" + fails + "(" + lastErr + ") " + size
 
               override fun frame(): Bitmap? {
-                  if (Build.SDK_INT < 30) return null
+                  if (Build.VERSION.SDK_INT < 30) return null
                   val svc = TapService.inst ?: return null
                   val wait = 350L - (System.currentTimeMillis() - lastReq)
                   if (wait > 0) Thread.sleep(wait)
@@ -1030,5 +1030,5 @@ jobs:
         run: gradle assembleDebug --no-daemon -p bot
       - uses: actions/upload-artifact@v4
         with:
-          name: MLLBB-apk
+          name: MegaDrocher-apk
           path: bot/app/build/outputs/apk/debug/app-debug.apk
