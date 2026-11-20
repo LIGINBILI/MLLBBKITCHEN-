@@ -1,1 +1,701 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project
+        run: |
+          mkdir -p bot
+          cat > bot/settings.gradle <<'EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "CookBot"
+          include ':app'
+          EOF_0
+          mkdir -p bot
+          cat > bot/build.gradle <<'EOF_1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF_1
+          mkdir -p bot
+          cat > bot/gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF_2
+          mkdir -p bot/app
+          cat > bot/app/build.gradle <<'EOF_3'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.bot.cook'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.bot.cook'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF_3
+          mkdir -p bot/app/src/main
+          cat > bot/app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application android:label="@string/app_name" android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".BotService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+                  <service android:name=".TapService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/tap_service" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p bot/app/src/main/res/xml
+          cat > bot/app/src/main/res/xml/tap_service.xml <<'EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/desc"
+              android:notificationTimeout="100" />
+          EOF_5
+          mkdir -p bot/app/src/main/res/values
+          cat > bot/app/src/main/res/values/strings.xml <<'EOF_6'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Cook Bot</string>
+              <string name="desc">Нажатия на экран для автоигры</string>
+          </resources>
+          EOF_6
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/Tpl.kt <<'EOF_7'
+          package com.bot.cook
 
+          object Tpl {
+              val DATA: Map<String, String> = mapOf(
+                  "burger" to "247,220,193,246,218,186,239,188,126,232,156,73,231,148,57,231,147,60,235,166,102,242,203,168,252,241,200,249,217,118,246,198,84,245,193,82,241,185,73,239,174,64,238,167,56,234,164,61,250,239,198,249,218,121,250,209,94,250,211,101,249,204,90,246,196,85,244,178,53,235,152,33,213,219,157,201,179,77,243,189,72,242,179,66,239,172,61,236,160,50,226,141,36,206,124,31,205,208,142,134,125,38,148,150,44,177,144,42,176,134,34,173,128,31,144,120,24,132,114,31,239,216,173,172,77,41,188,95,47,169,73,29,140,96,25,165,101,34,198,90,51,169,69,34,243,229,187,193,133,73,162,84,31,161,78,26,165,82,25,161,76,21,161,76,26,175,98,40,252,241,203,226,213,182,209,165,114,209,145,80,201,130,64,200,129,67,198,142,90,210,184,148",
+                  "chicken" to "250,236,207,254,249,222,252,250,219,253,249,217,254,250,218,254,249,221,254,249,221,254,249,221,250,236,208,244,220,175,230,167,75,237,176,64,244,200,97,251,238,189,254,250,220,255,249,221,242,213,174,214,128,31,236,163,29,246,189,55,249,194,60,245,203,80,252,241,205,254,250,219,212,154,105,205,102,16,228,137,20,243,168,31,245,180,50,248,193,66,243,213,133,253,250,221,213,160,118,199,97,18,218,112,18,233,143,18,238,157,25,244,180,49,241,181,58,246,227,183,230,211,187,180,96,45,201,95,11,205,94,13,217,114,16,219,118,17,219,146,62,235,204,184,249,236,209,219,209,194,191,146,117,185,119,80,181,122,77,187,136,103,184,127,95,208,176,166,250,236,207,254,249,221,253,249,221,249,246,222,247,245,222,250,249,220,248,243,220,236,222,201",
+                  "cola" to "254,249,221,242,236,230,225,203,209,221,190,188,204,166,160,214,185,178,237,229,228,254,249,221,254,248,222,232,216,210,164,106,96,138,78,60,125,71,58,140,82,73,212,187,184,254,249,221,253,249,222,233,164,165,234,122,124,230,149,156,214,142,152,208,116,132,203,113,130,255,249,221,254,249,223,242,186,178,238,47,54,248,84,92,234,46,64,195,22,52,213,118,128,254,250,220,254,249,222,248,220,205,230,122,131,241,166,170,227,74,90,195,47,76,212,134,144,246,238,214,254,249,221,254,244,219,232,156,168,230,149,160,230,147,160,194,106,133,196,164,172,214,204,190,254,249,222,253,248,220,232,132,137,237,105,114,227,66,82,188,60,89,172,141,150,246,240,215,254,249,222,254,250,220,246,240,221,244,231,224,242,226,220,223,212,205,242,236,213,255,249,220",
+                  "fries" to "254,249,222,254,248,222,254,249,221,252,242,195,251,243,182,249,243,207,251,241,180,253,249,221,246,243,223,230,224,166,245,233,173,244,217,136,245,225,116,235,200,101,243,218,123,195,203,195,246,230,171,223,190,104,243,217,117,246,230,129,227,162,65,230,168,67,242,200,92,231,192,98,233,220,183,238,200,96,229,170,80,212,121,38,229,163,64,240,202,93,217,138,46,192,132,60,234,214,174,229,173,84,184,86,20,205,127,50,203,137,55,198,119,42,216,137,52,225,159,74,237,142,119,223,106,87,215,144,113,203,122,99,223,150,117,203,125,102,211,134,120,229,96,89,243,191,164,231,112,98,231,114,101,235,129,113,227,100,91,231,125,111,225,114,103,227,121,106,251,243,215,236,201,175,240,213,186,237,208,183,237,199,175,239,215,183,234,198,170,233,207,182",
+                  "icecream" to "253,244,215,254,250,221,254,249,220,251,237,218,244,206,212,238,200,203,248,232,214,254,250,221,252,244,214,254,250,220,252,242,219,232,203,206,243,212,220,241,184,200,240,208,208,253,247,221,252,244,214,253,250,221,243,210,204,238,169,192,244,191,209,241,202,216,238,189,203,247,221,207,252,244,214,254,248,219,230,197,184,231,202,212,240,217,225,239,204,215,234,169,182,240,212,186,252,244,214,254,249,220,230,198,163,210,144,108,226,165,132,231,164,128,208,146,98,248,235,201,252,244,214,254,250,221,246,232,200,211,152,99,233,178,114,227,172,110,203,152,104,233,226,200,252,244,214,255,250,221,254,249,220,222,184,137,233,173,108,226,164,101,160,132,99,170,166,146,252,243,214,255,250,221,254,250,220,238,214,178,230,172,108,220,161,100,163,145,119,232,228,202",
+                  "pizza" to "254,247,215,255,250,221,254,249,220,253,246,214,250,239,204,250,239,206,253,248,218,254,249,221,251,246,213,247,216,171,236,166,113,231,137,91,238,178,117,226,143,103,230,148,102,244,206,162,243,197,142,236,169,110,237,181,146,230,164,136,235,172,122,233,159,122,238,167,121,232,159,103,238,168,98,231,152,104,235,154,117,238,183,148,231,138,104,237,176,136,238,149,111,241,183,137,235,161,93,242,191,137,244,208,170,231,126,93,241,187,152,248,220,185,236,189,161,234,171,126,231,193,143,239,172,96,239,177,119,242,181,133,240,196,153,241,191,139,232,156,105,236,169,98,250,243,216,227,199,159,221,168,110,226,157,91,234,172,94,230,168,94,220,171,113,226,202,165,253,248,219,254,249,221,252,248,220,244,236,207,237,229,200,243,238,209,253,248,220,254,249,221"
+              )
+          }
+          EOF_7
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/Cfg.kt <<'EOF_8'
+          package com.bot.cook
+
+          // Все координаты заданы для экрана 2576x1159 и автоматически масштабируются под телефон.
+          object Cfg {
+              fun p(x: Int, y: Int) = intArrayOf(x, y)
+
+              val COLA_M = p(470, 470)
+              val ICE_M = p(350, 830)
+              val CHK_SRC = p(620, 1080)
+              val POT_SRC = p(780, 1080)
+              val FRY1 = p(650, 880)
+              val FRY2 = p(800, 880)
+              val SAUSAGE = p(1080, 710)
+              val ONION = p(1090, 590)
+              val BASE1 = p(1280, 610)
+              val BASE2 = p(1280, 740)
+              val OVENS = listOf(p(1220, 890), p(1220, 985), p(1220, 1070))
+              val LETTUCE = p(1795, 610)
+              val TOMATO = p(1810, 720)
+              val BUN = p(1700, 900)
+              val PATTY = p(2100, 960)
+              val GRILLS = listOf(p(1970, 670), p(2170, 670), p(1990, 760), p(2170, 760))
+
+              // Где лежит готовое блюдо каждого типа
+              val SERVE: Map<String, List<IntArray>> = mapOf(
+                  "cola" to listOf(p(415, 590), p(470, 615), p(540, 565)),
+                  "icecream" to listOf(p(320, 1030), p(400, 1030), p(480, 990)),
+                  "burger" to listOf(p(1480, 620), p(1640, 620), p(1490, 730), p(1650, 730)),
+                  "pizza" to listOf(BASE1, BASE2),
+                  "fries" to listOf(p(855, 610), p(850, 720)),
+                  "chicken" to listOf(p(700, 620), p(690, 730))
+              )
+          }
+          EOF_8
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/Vision.kt <<'EOF_9'
+          package com.bot.cook
+
+          import android.graphics.Bitmap
+          import kotlin.math.abs
+
+          object Vision {
+              const val RW = 2576
+              const val RH = 1159
+              val SLOT_X = intArrayOf(1138, 1530, 1920)
+              private const val Y0 = 160
+              private const val Y1 = 432
+
+              private val templates: Map<String, IntArray> by lazy {
+                  Tpl.DATA.mapValues { e -> e.value.split(",").map { it.trim().toInt() }.toIntArray() }
+              }
+
+              private fun d(c: Int, r: Int, g: Int, b: Int): Int =
+                  abs(((c shr 16) and 255) - r) + abs(((c shr 8) and 255) - g) + abs((c and 255) - b)
+
+              // Читает заказ одного клиента: список блюд сверху вниз
+              fun slotItems(bmp: Bitmap, cx: Int): List<String> {
+                  val x0 = cx - 40
+                  val w = 94
+                  val ry0 = 120
+                  val h = 360
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, x0, ry0, w, h)
+                  fun at(x: Int, y: Int): Int = px[(y - ry0) * w + (x - x0)]
+
+                  var cream = 0
+                  var tot = 0
+                  for (y in Y0 until Y1) for (x in cx + 42 until cx + 52) {
+                      tot++
+                      if (d(at(x, y), 255, 250, 221) < 45) cream++
+                  }
+                  if (cream.toDouble() / tot < 0.6) return emptyList()
+
+                  val runs = ArrayList<IntArray>()
+                  var s = -1
+                  for (y in Y0 until Y1) {
+                      var c = 0
+                      for (x in cx - 36 until cx + 36) if (d(at(x, y), 255, 250, 221) > 90) c++
+                      val flag = c > 2
+                      if (flag && s < 0) s = y
+                      if (!flag && s >= 0) {
+                          if (y - s > 25) runs.add(intArrayOf(s, y))
+                          s = -1
+                      }
+                  }
+                  if (s >= 0 && Y1 - s > 25) runs.add(intArrayOf(s, Y1))
+
+                  val res = ArrayList<String>()
+                  for (run in runs) {
+                      val cy = (run[0] + run[1]) / 2
+                      val f = IntArray(192)
+                      for (by in 0 until 8) for (bx in 0 until 8) {
+                          var r = 0
+                          var g = 0
+                          var b = 0
+                          for (yy in 0 until 10) for (xx in 0 until 10) {
+                              val c = at(cx - 40 + bx * 10 + xx, cy - 40 + by * 10 + yy)
+                              r += (c shr 16) and 255
+                              g += (c shr 8) and 255
+                              b += c and 255
+                          }
+                          val i = (by * 8 + bx) * 3
+                          f[i] = r / 100
+                          f[i + 1] = g / 100
+                          f[i + 2] = b / 100
+                      }
+                      var best = "?"
+                      var bd = 1e9
+                      for ((name, t) in templates) {
+                          var sum = 0
+                          for (k in 0 until 192) sum += abs(f[k] - t[k])
+                          val m = sum / 192.0
+                          if (m < bd) {
+                              bd = m
+                              best = name
+                          }
+                      }
+                      res.add(if (bd > 45) "?" else best)
+                  }
+                  return res
+              }
+
+              // 0 - пусто, 1 - сырая котлета, 2 - готовая
+              fun grillState(bmp: Bitmap, x: Int, y: Int): Int {
+                  val px = IntArray(24 * 24)
+                  bmp.getPixels(px, 0, 24, x - 12, y - 12, 24, 24)
+                  var r = 0
+                  var g = 0
+                  var b = 0
+                  for (c in px) {
+                      r += (c shr 16) and 255
+                      g += (c shr 8) and 255
+                      b += c and 255
+                  }
+                  r /= px.size
+                  g /= px.size
+                  b /= px.size
+                  if (b < 60 && r > 130 && r - g > 50) return 2
+                  if (r > 200 && r - g > 70 && b > 90) return 1
+                  return 0
+              }
+          }
+          EOF_9
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/Capture.kt <<'EOF_10'
+          package com.bot.cook
+
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+
+          class Capture(proj: MediaProjection, private val w: Int, private val h: Int, dpi: Int) {
+              private val reader: ImageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+              private val vd: VirtualDisplay = proj.createVirtualDisplay(
+                  "cookbot", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, null
+              )
+              private var last: Bitmap? = null
+
+              // Последний кадр, приведённый к размеру 2576x1159
+              fun frame(): Bitmap? {
+                  val img = reader.acquireLatestImage()
+                  if (img != null) {
+                      val p = img.planes[0]
+                      val tmp = Bitmap.createBitmap(p.rowStride / p.pixelStride, h, Bitmap.Config.ARGB_8888)
+                      tmp.copyPixelsFromBuffer(p.buffer)
+                      img.close()
+                      val cropped = Bitmap.createBitmap(tmp, 0, 0, w, h)
+                      val scaled = Bitmap.createScaledBitmap(cropped, Vision.RW, Vision.RH, true)
+                      if (cropped !== scaled) cropped.recycle()
+                      if (tmp !== cropped) tmp.recycle()
+                      last?.recycle()
+                      last = scaled
+                  }
+                  return last
+              }
+
+              fun release() {
+                  vd.release()
+                  reader.close()
+              }
+          }
+          EOF_10
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/TapService.kt <<'EOF_11'
+          package com.bot.cook
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Path
+          import android.util.DisplayMetrics
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class TapService : AccessibilityService() {
+              override fun onServiceConnected() {
+                  inst = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  inst = null
+                  return super.onUnbind(intent)
+              }
+
+              // Серия быстрых нажатий; ждёт завершения
+              private fun doRun(pts: List<IntArray>, gap: Long) {
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                  val sw = max(dm.widthPixels, dm.heightPixels).toFloat()
+                  val sh = min(dm.widthPixels, dm.heightPixels).toFloat()
+                  for (chunk in pts.chunked(10)) {
+                      val b = GestureDescription.Builder()
+                      chunk.forEachIndexed { i, p ->
+                          val path = Path()
+                          path.moveTo(p[0] * sw / Vision.RW, p[1] * sh / Vision.RH)
+                          b.addStroke(GestureDescription.StrokeDescription(path, i * gap, 20L))
+                      }
+                      val latch = CountDownLatch(1)
+                      val ok = dispatchGesture(b.build(), object : GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) {
+                              latch.countDown()
+                          }
+
+                          override fun onCancelled(gestureDescription: GestureDescription?) {
+                              latch.countDown()
+                          }
+                      }, null)
+                      if (ok) latch.await(chunk.size * gap + 1500, TimeUnit.MILLISECONDS)
+                  }
+              }
+
+              companion object {
+                  @Volatile
+                  var inst: TapService? = null
+
+                  fun ready(): Boolean = inst != null
+
+                  fun run(pts: List<IntArray>, gap: Long = 85L) {
+                      inst?.doRun(pts, gap)
+                  }
+              }
+          }
+          EOF_11
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/Engine.kt <<'EOF_12'
+          package com.bot.cook
+
+          class Engine(private val cap: Capture, private val ui: (String) -> Unit) : Thread() {
+              @Volatile
+              var running = true
+              private val last = HashMap<String, Long>()
+              private val collectAt = HashMap<String, Long>()
+              private val ru = mapOf(
+                  "pizza" to "пицца", "burger" to "бургер", "cola" to "кола",
+                  "icecream" to "мороженое", "fries" to "фри", "chicken" to "курица", "?" to "?"
+              )
+
+              private fun now() = System.currentTimeMillis()
+
+              private fun due(k: String, ms: Long): Boolean {
+                  val n = now()
+                  val l = last[k] ?: 0L
+                  if (n - l >= ms) {
+                      last[k] = n
+                      return true
+                  }
+                  return false
+              }
+
+              private fun tap(pts: List<IntArray>) {
+                  TapService.run(pts)
+              }
+
+              // Приготовление: нажать источник, подождать cookMs, нажать выход
+              private fun cook(key: String, src: List<IntArray>, out: List<IntArray>, cookMs: Long) {
+                  val c = collectAt[key]
+                  if (c != null) {
+                      if (now() >= c) {
+                          tap(out)
+                          collectAt.remove(key)
+                      }
+                  } else if (due(key, 1500)) {
+                      tap(src)
+                      collectAt[key] = now() + cookMs
+                  }
+              }
+
+              override fun run() {
+                  while (running) {
+                      try {
+                          step()
+                      } catch (e: Exception) {
+                          ui("Ошибка: " + e.message)
+                      }
+                      try {
+                          Thread.sleep(150)
+                      } catch (e: InterruptedException) {
+                          return
+                      }
+                  }
+              }
+
+              private fun step() {
+                  val bmp = cap.frame()
+                  if (bmp == null) {
+                      ui("Нет кадра экрана")
+                      Thread.sleep(400)
+                      return
+                  }
+                  val slots = Vision.SLOT_X.map { Vision.slotItems(bmp, it) }
+                  val need = HashSet<String>()
+                  for (s in slots) need.addAll(s)
+                  val sb = StringBuilder()
+                  for ((i, s) in slots.withIndex()) {
+                      sb.append(i + 1).append(": ")
+                      sb.append(if (s.isEmpty()) "-" else s.joinToString("+") { ru[it] ?: it })
+                      sb.append("\n")
+                  }
+                  if (!TapService.ready()) {
+                      ui(sb.toString() + "Включи службу спецвозможностей!")
+                      Thread.sleep(500)
+                      return
+                  }
+                  ui(sb.toString().trim())
+                  if (need.isEmpty()) {
+                      Thread.sleep(300)
+                      return
+                  }
+
+                  // 1. Подача готового блюда клиенту
+                  for ((si, items) in slots.withIndex()) {
+                      for (name in items.distinct()) {
+                          val locs = Cfg.SERVE[name] ?: continue
+                          if (due("s$si$name", 1100)) {
+                              val pts = ArrayList<IntArray>()
+                              for (l in locs.take(4)) {
+                                  pts.add(l)
+                                  pts.add(Cfg.p(Vision.SLOT_X[si], 330))
+                              }
+                              tap(pts)
+                          }
+                      }
+                  }
+
+                  // 2. Приготовление нужного
+                  if ("cola" in need && due("cola", 3500)) tap(listOf(Cfg.COLA_M))
+                  if ("icecream" in need && due("ice", 3500)) tap(listOf(Cfg.ICE_M))
+                  if ("chicken" in need) cook("chk", listOf(Cfg.CHK_SRC), listOf(Cfg.FRY1), 5500)
+                  if ("fries" in need) cook("fry", listOf(Cfg.POT_SRC), listOf(Cfg.FRY2), 5500)
+                  if ("pizza" in need) {
+                      cook(
+                          "piz",
+                          listOf(Cfg.SAUSAGE, Cfg.ONION, Cfg.BASE1, Cfg.SAUSAGE, Cfg.ONION, Cfg.BASE2),
+                          Cfg.OVENS, 6000
+                      )
+                  }
+                  if ("burger" in need) {
+                      val st = Cfg.GRILLS.map { Vision.grillState(bmp, it[0], it[1]) }
+                      if (st.any { it == 0 } && due("pat", 4000)) tap(listOf(Cfg.PATTY))
+                      val ready = ArrayList<IntArray>()
+                      for ((i, g) in Cfg.GRILLS.withIndex()) if (st[i] == 2) ready.add(g)
+                      if (ready.isNotEmpty() && due("grl", 900)) tap(ready)
+                      if (due("bun", 3500)) tap(listOf(Cfg.LETTUCE, Cfg.TOMATO, Cfg.BUN))
+                  }
+              }
+          }
+          EOF_12
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/BotService.kt <<'EOF_13'
+          package com.bot.cook
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class BotService : Service() {
+              private var proj: MediaProjection? = null
+              private var cap: Capture? = null
+              private var engine: Engine? = null
+              private var wm: WindowManager? = null
+              private var panel: LinearLayout? = null
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              @Suppress("DEPRECATION")
+              private fun readData(i: Intent): Intent? = i.getParcelableExtra<Intent>("data")
+
+              @Suppress("DEPRECATION")
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent == null) return START_NOT_STICKY
+                  val ch = "cookbot"
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(NotificationChannel(ch, "Cook Bot", NotificationManager.IMPORTANCE_LOW))
+                  val n: Notification = Notification.Builder(this, ch)
+                      .setContentTitle("Бот запущен")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  val code = intent.getIntExtra("code", 0)
+                  val data = readData(intent) ?: return START_NOT_STICKY
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  val p = mpm.getMediaProjection(code, data)
+                  p.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          stopSelf()
+                      }
+                  }, main)
+                  proj = p
+                  val dm = DisplayMetrics()
+                  (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                  cap = Capture(p, max(dm.widthPixels, dm.heightPixels), min(dm.widthPixels, dm.heightPixels), dm.densityDpi)
+                  showPanel()
+                  return START_NOT_STICKY
+              }
+
+              private fun showPanel() {
+                  val w = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val tv = TextView(this)
+                  tv.setTextColor(Color.WHITE)
+                  tv.textSize = 11f
+                  tv.text = "Готов"
+                  val btn = Button(this)
+                  btn.text = "СТАРТ"
+                  val close = Button(this)
+                  close.text = "X"
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.addView(btn)
+                  row.addView(close)
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setBackgroundColor(Color.argb(150, 0, 0, 0))
+                  box.addView(row)
+                  box.addView(tv)
+                  btn.setOnClickListener {
+                      val e = engine
+                      if (e != null && e.running) {
+                          e.running = false
+                          engine = null
+                          btn.text = "СТАРТ"
+                      } else {
+                          val c = cap
+                          if (c != null) {
+                              val ne = Engine(c) { s -> main.post { tv.text = s } }
+                              engine = ne
+                              ne.start()
+                              btn.text = "СТОП"
+                          }
+                      }
+                  }
+                  close.setOnClickListener { stopSelf() }
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.BOTTOM or Gravity.END
+                  w.addView(box, lp)
+                  panel = box
+              }
+
+              override fun onDestroy() {
+                  engine?.running = false
+                  panel?.let { wm?.removeView(it) }
+                  cap?.release()
+                  proj?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF_13
+          mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/MainActivity.kt <<'EOF_14'
+          package com.bot.cook
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  }
+                  val l = LinearLayout(this)
+                  l.orientation = LinearLayout.VERTICAL
+                  l.setPadding(40, 80, 40, 40)
+                  val info = TextView(this)
+                  info.text = "Выполни шаги 1-3 по порядку, потом открой игру и нажми СТАРТ на плавающей панели (справа внизу)."
+                  l.addView(info)
+                  fun add(t: String, a: () -> Unit) {
+                      val b = Button(this)
+                      b.text = t
+                      b.setOnClickListener { a() }
+                      l.addView(b)
+                  }
+                  add("1. Разрешить поверх других окон") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+                  }
+                  add("2. Включить службу спецвозможностей") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  add("3. Запустить бота") {
+                      val m = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      startActivityForResult(m.createScreenCaptureIntent(), 7)
+                  }
+                  val sv = ScrollView(this)
+                  sv.addView(l)
+                  setContentView(sv)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 7 && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, BotService::class.java)
+                      i.putExtra("code", resultCode)
+                      i.putExtra("data", data)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF_14
+      - name: Build
+        run: gradle assembleDebug --no-daemon -p bot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CookBot-apk
+          path: bot/app/build/outputs/apk/debug/app-debug.apk
