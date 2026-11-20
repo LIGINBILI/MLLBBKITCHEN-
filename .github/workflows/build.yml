@@ -1030,5 +1030,5 @@ jobs:
         run: gradle assembleDebug --no-daemon -p bot
       - uses: actions/upload-artifact@v4
         with:
-          name: CookBot-apk
+          name: MLLBB-apk
           path: bot/app/build/outputs/apk/debug/app-debug.apk
