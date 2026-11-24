@@ -65,6 +65,7 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
               <application android:label="@string/app_name" android:theme="@android:style/Theme.DeviceDefault.Light">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
@@ -105,6 +106,97 @@ jobs:
           </resources>
           EOF_6
           mkdir -p bot/app/src/main/java/com/bot/cook
+          cat > bot/app/src/main/java/com/bot/cook/BotLog.kt <<'EOF_LOG'
+          package com.bot.cook
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object BotLog {
+              private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+              private val lock = Any()
+              @Volatile
+              private var appCtx: Context? = null
+              @Volatile
+              private var mediaUri: Uri? = null
+
+              fun init(c: Context) {
+                  appCtx = c.applicationContext
+                  val prev = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      w("CRASH thread=${t.name}: ${e.stackTraceToString()}")
+                      prev?.uncaughtException(t, e)
+                  }
+                  w("=== SESSION START (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT}, ${Build.MODEL}) ===")
+              }
+
+              fun w(msg: String) {
+                  val line = "${fmt.format(Date())} | $msg\n"
+                  synchronized(lock) {
+                      try {
+                          val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                          if (!dir.exists()) dir.mkdirs()
+                          val f = File(dir, "CookBot_log.txt")
+                          FileOutputStream(f, true).use { fos ->
+                              fos.write(line.toByteArray(Charsets.UTF_8))
+                              fos.flush()
+                              try { fos.fd.sync() } catch (_: Throwable) {}
+                          }
+                          return
+                      } catch (_: Throwable) {
+                      }
+                      // Fallback через MediaStore для Android 10+ при ограничениях прямой записи
+                      val ctx = appCtx ?: return
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          try {
+                              val resolver = ctx.contentResolver
+                              var uri = mediaUri
+                              if (uri == null) {
+                                  val sel = "${MediaStore.Downloads.DISPLAY_NAME}=?"
+                                  resolver.query(
+                                      MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                                      arrayOf(MediaStore.Downloads._ID),
+                                      sel,
+                                      arrayOf("CookBot_log.txt"),
+                                      null
+                                  )?.use { cur ->
+                                      if (cur.moveToFirst()) {
+                                          val id = cur.getLong(0)
+                                          uri = Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id.toString())
+                                      }
+                                  }
+                                  if (uri == null) {
+                                      val cv = ContentValues().apply {
+                                          put(MediaStore.Downloads.DISPLAY_NAME, "CookBot_log.txt")
+                                          put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                                      }
+                                      uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                                  }
+                                  mediaUri = uri
+                              }
+                              if (uri != null) {
+                                  resolver.openOutputStream(uri, "wa")?.use { os ->
+                                      os.write(line.toByteArray(Charsets.UTF_8))
+                                      os.flush()
+                                  }
+                              }
+                          } catch (_: Throwable) {
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_LOG
           cat > bot/app/src/main/java/com/bot/cook/Tpl.kt <<'EOF_7'
           package com.bot.cook
 
@@ -568,14 +660,19 @@ jobs:
           class TapService : AccessibilityService() {
               override fun onServiceConnected() {
                   S.init(this)
+                  BotLog.init(this)
+                  BotLog.w("TapService connected")
                   inst = this
               }
 
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
-              override fun onInterrupt() {}
+              override fun onInterrupt() {
+                  BotLog.w("TapService interrupted")
+              }
 
               override fun onUnbind(intent: Intent?): Boolean {
+                  BotLog.w("TapService unbound")
                   inst = null
                   return super.onUnbind(intent)
               }
@@ -592,7 +689,19 @@ jobs:
                   val factor = S.get("screenScale").coerceIn(50, 150) / 100f
                   val sw = cw.toFloat() * factor
                   val sh = ch.toFloat() * factor
-                  for (chunk in acts.chunked(8)) {
+                  val desc = acts.joinToString(";") { a ->
+                      val sx1 = (a.x1 * sw / Vision.RW).toInt()
+                      val sy1 = (a.y1 * sh / Vision.RH).toInt()
+                      if (a.drag) {
+                          val sx2 = (a.x2 * sw / Vision.RW).toInt()
+                          val sy2 = (a.y2 * sh / Vision.RH).toInt()
+                          "SWIPE($sx1,$sy1->$sx2,$sy2)"
+                      } else {
+                          "TAP($sx1,$sy1)"
+                      }
+                  }
+                  BotLog.w("GESTURE_DISPATCH count=${acts.size} gap=${gap}ms screen=${cw}x${ch}@${(factor * 100).toInt()}% acts=[$desc]")
+                  for ((ci, chunk) in acts.chunked(8).withIndex()) {
                       val b = GestureDescription.Builder()
                       var t = 0L
                       for (a in chunk) {
@@ -609,16 +718,24 @@ jobs:
                           t += dur + gap
                       }
                       val latch = CountDownLatch(1)
+                      var status = "not_dispatched"
                       val ok = dispatchGesture(b.build(), object : GestureResultCallback() {
                           override fun onCompleted(gestureDescription: GestureDescription?) {
+                              status = "completed"
                               latch.countDown()
                           }
 
                           override fun onCancelled(gestureDescription: GestureDescription?) {
+                              status = "cancelled"
                               latch.countDown()
                           }
                       }, null)
-                      if (ok) latch.await(t + 1500, TimeUnit.MILLISECONDS)
+                      if (ok) {
+                          val done = latch.await(t + 1500, TimeUnit.MILLISECONDS)
+                          BotLog.w("GESTURE_CHUNK idx=$ci size=${chunk.size} dur=${t}ms result=${if (done) status else "timeout"}")
+                      } else {
+                          BotLog.w("GESTURE_CHUNK idx=$ci dispatchGesture returned FALSE")
+                      }
                   }
               }
 
@@ -740,6 +857,7 @@ jobs:
               }
 
               private fun stopBotCompletely(msg: String) {
+                  BotLog.w("Engine stopBotCompletely: $msg")
                   running = false
                   ui(msg)
                   onStopBot?.invoke()
@@ -762,18 +880,22 @@ jobs:
               }
 
               override fun run() {
+                  BotLog.w("Engine thread started")
                   while (running) {
                       try {
                           step()
                       } catch (e: Throwable) {
+                          BotLog.w("Engine step error: ${e.stackTraceToString()}")
                           ui("Ошибка: " + e.toString())
                       }
                       try {
                           Thread.sleep(S.get("loopMs").toLong())
                       } catch (e: InterruptedException) {
+                          BotLog.w("Engine interrupted")
                           return
                       }
                   }
+                  BotLog.w("Engine thread stopped")
               }
 
               private fun readyAt(dish: String, i: Int, p: IntArray, bmp: Bitmap): Boolean {
@@ -846,7 +968,10 @@ jobs:
                           }
                       }
                   }
-                  if (acts.isNotEmpty()) go(acts, S.get("serveGap").toLong())
+                  if (acts.isNotEmpty()) {
+                      BotLog.w("ACTION serve count=${acts.size}")
+                      go(acts, S.get("serveGap").toLong())
+                  }
               }
 
               private fun cook(key: String, dish: String, src: IntArray, out: IntArray, cookMs: Long, want: Int) {
@@ -854,19 +979,21 @@ jobs:
                   if (c != null) {
                       if (now() >= c) {
                           val k = cookN[key] ?: 1
+                          BotLog.w("ACTION collect dish=$dish count=$k")
                           go(List(k) { tapA(out) })
                           collectAt.remove(key)
                           for (i in 0 until k) mark(madeAt, dish)
                       }
                   } else if (want > 0 && due(key, 800L)) {
                       val k = minOf(want, 2)
+                      BotLog.w("ACTION start_fry dish=$dish count=$k")
                       go(List(k) { tapA(src) })
                       cookN[key] = k
                       collectAt[key] = now() + cookMs
                   }
               }
 
-              // Без задержки между ингредиентами пиццы
+              // Пицца: стандартная задержка tapGap между нажатиями, как при сборке бургеров
               private fun pizza(count: Int) {
                   if (now() < pizzaBusyUntil) return
                   val n = minOf(count, 2)
@@ -877,7 +1004,8 @@ jobs:
                   }
                   val bases = listOf(tapA(Cfg.BASE1), tapA(Cfg.BASE2))
                   acts.addAll(bases.take(n))
-                  go(acts, 0L)
+                  BotLog.w("ACTION pizza count=$n acts=${acts.size}")
+                  go(acts)
                   for (i in 0 until n) mark(madeAt, "pizza")
                   pizzaBusyUntil = now() + S.get("pizzaRound").toLong()
               }
@@ -902,6 +1030,7 @@ jobs:
                           acts.add(tapA(Cfg.TOMATO))
                           acts.add(tapA(Cfg.BUN))
                       }
+                      BotLog.w("ACTION burger_assemble take=${take.size}")
                       go(acts)
                       burgerAssembleAt = n + 1400L
                       return
@@ -910,6 +1039,7 @@ jobs:
                   val wantMore = minOf(4 - hb, tgt - hb) - onGrill
                   if (wantMore > 0 && freeGrill > 0 && due("b_patty", 900L)) {
                       val putCount = minOf(wantMore, freeGrill)
+                      BotLog.w("ACTION burger_patty put=$putCount")
                       go(List(putCount) { tapA(Cfg.PATTY) })
                   }
               }
@@ -922,6 +1052,7 @@ jobs:
                           roundPhase = 1
                           endSeenAt = n
                           resetRoundState()
+                          BotLog.w("AUTO_ROUND phase=1 round_end_detected")
                           ui("Раунд окончен — жду 1с до Подтвердить")
                           return true
                       }
@@ -930,6 +1061,7 @@ jobs:
                   if (roundPhase == 1) {
                       ui("Авто-цикл: жду Подтвердить...")
                       if (n - endSeenAt >= 1000L) {
+                          BotLog.w("AUTO_ROUND phase=1->2 click_confirm")
                           go(listOf(tapA(Cfg.BTN_CONFIRM)))
                           roundPhase = 2
                           lobbySince = n
@@ -943,6 +1075,7 @@ jobs:
                           return true
                       }
                       if (startClickedAt == 0L && Vision.isLobbyStart(bmp) && n - lobbySince >= 600L) {
+                          BotLog.w("AUTO_ROUND phase=2->3 click_start")
                           ui("Авто-цикл: жму Начать")
                           go(listOf(tapA(Cfg.BTN_START)))
                           startClickedAt = n
@@ -961,6 +1094,7 @@ jobs:
                       ui("Старт через " + ((rem + 999L) / 1000L) + " с...")
                       return true
                   }
+                  BotLog.w("AUTO_ROUND phase=3->0 resume_round")
                   roundPhase = 0
                   resetRoundState()
                   return false
@@ -991,6 +1125,10 @@ jobs:
                   val av = scan(bmp)
                   val active = dem.isNotEmpty() || S.get("idle") == 1
 
+                  if (frames <= 10 || frames % 15 == 0) {
+                      BotLog.w("STEP frame=$frames slots=$slots have=$have info=${cap.info()}")
+                  }
+
                   val sb = StringBuilder()
                   for ((i, s) in slots.withIndex()) {
                       sb.append(i + 1).append(": ")
@@ -1014,6 +1152,7 @@ jobs:
                   val wCola = target("cola", dem, active) - haveOf("cola") - made("cola")
                   if (wCola > 0 && due("cola", 700L)) {
                       val k = minOf(wCola, 3)
+                      BotLog.w("ACTION cola count=$k")
                       go(List(k) { tapA(Cfg.COLA_M) })
                       tapAt["cola"] = now()
                       for (i in 0 until k) mark(madeAt, "cola")
@@ -1021,6 +1160,7 @@ jobs:
                   val wIce = target("icecream", dem, active) - haveOf("icecream") - made("icecream")
                   if (wIce > 0 && due("ice", 700L)) {
                       val k = minOf(wIce, 3)
+                      BotLog.w("ACTION icecream count=$k")
                       go(List(k) { tapA(Cfg.ICE_M) })
                       tapAt["icecream"] = now()
                       for (i in 0 until k) mark(madeAt, "icecream")
@@ -1088,6 +1228,8 @@ jobs:
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent == null) return START_NOT_STICKY
                   S.init(this)
+                  BotLog.init(this)
+                  BotLog.w("BotService onStartCommand")
                   val ch = "cookbot"
                   val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                   nm.createNotificationChannel(NotificationChannel(ch, "Cook Bot", NotificationManager.IMPORTANCE_LOW))
@@ -1106,6 +1248,7 @@ jobs:
                   val p = mpm.getMediaProjection(code, data)
                   p.registerCallback(object : MediaProjection.Callback() {
                       override fun onStop() {
+                          BotLog.w("MediaProjection onStop")
                           stopSelf()
                       }
                   }, main)
@@ -1177,6 +1320,7 @@ jobs:
                   btn.setOnClickListener {
                       val e = engine
                       if (e != null && e.running) {
+                          BotLog.w("UI button STOP clicked")
                           e.running = false
                           engine = null
                           btn.text = "СТАРТ"
@@ -1184,6 +1328,7 @@ jobs:
                       } else {
                           val c = frames
                           if (c != null) {
+                              BotLog.w("UI button START clicked | settings=${S.exportJson()}")
                               val ne = Engine(
                                   c,
                                   { s -> main.post { tv.text = s } },
@@ -1196,7 +1341,10 @@ jobs:
                           }
                       }
                   }
-                  close.setOnClickListener { stopSelf() }
+                  close.setOnClickListener {
+                      BotLog.w("UI button CLOSE clicked")
+                      stopSelf()
+                  }
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.WRAP_CONTENT,
@@ -1235,6 +1383,7 @@ jobs:
               }
 
               override fun onDestroy() {
+                  BotLog.w("BotService onDestroy")
                   engine?.running = false
                   panel?.let { wm?.removeView(it) }
                   cap?.release()
@@ -1289,6 +1438,7 @@ jobs:
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   S.init(this)
+                  BotLog.init(this)
                   if (S.get("screenW") <= 0 || S.get("screenH") <= 0) {
                       val dm = DisplayMetrics()
                       @Suppress("DEPRECATION")
@@ -1298,6 +1448,8 @@ jobs:
                   }
                   if (Build.VERSION.SDK_INT >= 33) {
                       requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  } else if (Build.VERSION.SDK_INT <= 28) {
+                      requestPermissions(arrayOf("android.permission.WRITE_EXTERNAL_STORAGE"), 2)
                   }
                   val l = LinearLayout(this)
                   l.orientation = LinearLayout.VERTICAL
@@ -1312,7 +1464,7 @@ jobs:
                   l.addView(header)
 
                   val info = TextView(this)
-                  info.text = "Выполни шаги 1–3 по порядку, настрой экран при необходимости и нажми СТАРТ на плавающей панели."
+                  info.text = "Выполни шаги 1–3 по порядку, настрой экран при необходимости и нажми СТАРТ на плавающей панели. Логи пишутся в Download/CookBot_log.txt."
                   info.setTextColor(Color.rgb(148, 163, 184))
                   info.textSize = 13f
                   info.setPadding(0, dp(8), 0, dp(16))
