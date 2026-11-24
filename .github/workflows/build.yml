@@ -100,7 +100,7 @@ jobs:
           cat > bot/app/src/main/res/values/strings.xml <<'EOF_6'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">tg@aiym_ln </string>
+              <string name="app_name">MegaDrocher</string>
               <string name="desc">Нажатия на экран для автоигры</string>
           </resources>
           EOF_6
@@ -123,8 +123,7 @@ jobs:
           cat > bot/app/src/main/java/com/bot/cook/Cfg.kt <<'EOF_8'
           package com.bot.cook
 
-          // Все координаты заданы для экрана 2576x1159 и автоматически масштабируются под телефон.
-          // Значения сверены с видео, где касания были видны на экране.
+          // Все координаты заданы для экрана 2576x1159 и масштабируются под выбранное разрешение и масштаб.
           object Cfg {
               fun p(x: Int, y: Int) = intArrayOf(x, y)
 
@@ -586,8 +585,13 @@ jobs:
                   val dm = DisplayMetrics()
                   @Suppress("DEPRECATION")
                   (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
-                  val sw = max(dm.widthPixels, dm.heightPixels).toFloat()
-                  val sh = min(dm.widthPixels, dm.heightPixels).toFloat()
+                  val defW = max(dm.widthPixels, dm.heightPixels)
+                  val defH = min(dm.widthPixels, dm.heightPixels)
+                  val cw = S.get("screenW").takeIf { it > 0 } ?: defW
+                  val ch = S.get("screenH").takeIf { it > 0 } ?: defH
+                  val factor = S.get("screenScale").coerceIn(50, 150) / 100f
+                  val sw = cw.toFloat() * factor
+                  val sh = ch.toFloat() * factor
                   for (chunk in acts.chunked(8)) {
                       val b = GestureDescription.Builder()
                       var t = 0L
@@ -635,6 +639,7 @@ jobs:
           package com.bot.cook
 
           import android.graphics.Bitmap
+          import kotlin.math.maxOf
 
           class Src(val key: String, val p: IntArray)
 
@@ -655,19 +660,16 @@ jobs:
               private val madeAt = HashMap<String, ArrayList<Long>>()
               private val tapAt = HashMap<String, Long>()
               private val have = HashMap<String, Int>()
+              private val slotFirstAt = HashMap<Int, Long>()
               private var frames = 0
               private var burgerAssembleAt = 0L
               private var pizzaBusyUntil = 0L
 
-              // Состояние авто-цикла раундов:
-              // 0 - обычный раунд, 1 - ждём 1с после конца раунда и жмём Подтвердить,
-              // 2 - ждём кнопку Начать и жмём её, 3 - ждём 3с после Начать и возобновляем работу
               private var roundPhase = 0
               private var endSeenAt = 0L
               private var lobbySince = 0L
               private var startClickedAt = 0L
 
-              // Сколько миллисекунд блюдо считается "уже поставлено готовиться"
               private fun pend(dish: String): Long = when (dish) {
                   "cola" -> 2400L
                   "icecream" -> 2800L
@@ -685,7 +687,6 @@ jobs:
 
               private fun now() = System.currentTimeMillis()
 
-              // Короткая подпись кадра: если она не меняется, кадр завис
               private fun sig(b: Bitmap): Int {
                   var h = 17
                   for (i in 1..8) for (j in 1..4) h = h * 31 + b.getPixel(b.width * i / 9, b.height * j / 5)
@@ -734,6 +735,7 @@ jobs:
                   madeAt.clear()
                   tapAt.clear()
                   have.clear()
+                  slotFirstAt.clear()
                   burgerAssembleAt = 0L
                   pizzaBusyUntil = 0L
               }
@@ -744,7 +746,6 @@ jobs:
                   onStopBot?.invoke()
               }
 
-              // Сколько штук блюда держать готовыми: заказы клиентов или запас из настроек (что больше), но не больше мест
               private fun target(dish: String, dem: Map<String, Int>, active: Boolean): Int {
                   val room = Cfg.SERVE[dish]?.size ?: 0
                   val d = dem[dish] ?: 0
@@ -776,7 +777,6 @@ jobs:
                   }
               }
 
-              // Лежит ли на этой позиции готовое блюдо (по цвету в точке)
               private fun readyAt(dish: String, i: Int, p: IntArray, bmp: Bitmap): Boolean {
                   return when (dish) {
                       "pizza" -> Vision.ovenReady(bmp, p[0], p[1])
@@ -784,7 +784,6 @@ jobs:
                   }
               }
 
-              // Просматривает все позиции с готовыми блюдами. Блюдо считается готовым, если его видно на двух кадрах подряд.
               private fun scan(bmp: Bitmap): HashMap<String, ArrayList<Src>> {
                   val n = now()
                   val delay = S.get("serveDelay").toLong()
@@ -813,13 +812,26 @@ jobs:
                   return res
               }
 
-              // Подача: тянем готовое блюдо только тем клиентам, которым оно ещё нужно
+              private fun updateSlotArrival(slots: List<List<String>>, n: Long) {
+                  for ((si, items) in slots.withIndex()) {
+                      val hasOrder = items.any { it != "?" && it != "check" }
+                      if (hasOrder) {
+                          if (!slotFirstAt.containsKey(si)) slotFirstAt[si] = n
+                      } else {
+                          slotFirstAt.remove(si)
+                      }
+                  }
+              }
+
+              // Подача: сначала тем клиентам, кто пришёл раньше всех
               private fun serve(slots: List<List<String>>, av: HashMap<String, ArrayList<Src>>) {
                   if (S.get("serveOn") == 0) return
                   val maxN = S.get("serveMax")
                   val acts = ArrayList<Act>()
                   val n = now()
-                  for ((si, items) in slots.withIndex()) {
+                  val orderByEarliest = slots.indices.sortedBy { si -> slotFirstAt[si] ?: Long.MAX_VALUE }
+                  for (si in orderByEarliest) {
+                      val items = slots[si]
                       val counts = items.groupingBy { it }.eachCount()
                       for ((name, cnt) in counts) {
                           if (name == "?" || name == "check") continue
@@ -838,7 +850,6 @@ jobs:
                   if (acts.isNotEmpty()) go(acts, S.get("serveGap").toLong())
               }
 
-              // Фритюрница: быстро нажать источник нужное число раз, подождать, забрать на тарелки
               private fun cook(key: String, dish: String, src: IntArray, out: IntArray, cookMs: Long, want: Int) {
                   val c = collectAt[key]
                   if (c != null) {
@@ -856,19 +867,18 @@ jobs:
                   }
               }
 
+              // Без задержки между ингредиентами пиццы
               private fun pizza(count: Int) {
                   if (now() < pizzaBusyUntil) return
                   val n = minOf(count, 2)
-                  val pg = S.get("pizzaGap").toLong()
                   val acts = ArrayList<Act>()
                   for (i in 0 until n) {
                       acts.add(tapA(Cfg.SAUSAGE))
                       acts.add(tapA(Cfg.ONION))
                   }
-                  go(acts, pg)
-                  Thread.sleep(400)
                   val bases = listOf(tapA(Cfg.BASE1), tapA(Cfg.BASE2))
-                  go(bases.take(n), pg)
+                  acts.addAll(bases.take(n))
+                  go(acts, 0L)
                   for (i in 0 until n) mark(madeAt, "pizza")
                   pizzaBusyUntil = now() + S.get("pizzaRound").toLong()
               }
@@ -883,7 +893,6 @@ jobs:
                   val freeGrill = gs.count { it == 0 }
                   val n = now()
 
-                  // 1. Если есть готовая котлета на гриле и есть место на тарелках — забираем и собираем бургер
                   if (readyGrills.isNotEmpty() && hb < 4 && n >= burgerAssembleAt && due("b_take", 700L)) {
                       val roomPlates = 4 - hb
                       val take = readyGrills.take(roomPlates)
@@ -899,7 +908,6 @@ jobs:
                       return
                   }
 
-                  // 2. Если нужно больше бургеров и есть свободные слоты на гриле — кладём сырые котлеты
                   val wantMore = minOf(4 - hb, tgt - hb) - onGrill
                   if (wantMore > 0 && freeGrill > 0 && due("b_patty", 900L)) {
                       val putCount = minOf(wantMore, freeGrill)
@@ -920,7 +928,6 @@ jobs:
                       }
                       return false
                   }
-                  // На фазах 1..3 запрещены любые другие клики кроме Подтвердить -> Начать
                   if (roundPhase == 1) {
                       ui("Авто-цикл: жду Подтвердить...")
                       if (n - endSeenAt >= 1000L) {
@@ -950,7 +957,6 @@ jobs:
                       ui("Авто-цикл: переход в лобби...")
                       return true
                   }
-                  // roundPhase == 3: ждём 3 секунды после нажатия Начать
                   val rem = maxOf(0L, 3000L - (n - startClickedAt))
                   if (rem > 0L) {
                       ui("Старт через " + ((rem + 999L) / 1000L) + " с...")
@@ -978,9 +984,11 @@ jobs:
                       Thread.sleep(200)
                       return
                   }
+                  val n = now()
                   val slots = Vision.SLOT_X.map { Vision.slotItems(bmp, it) }
+                  updateSlotArrival(slots, n)
                   val dem = HashMap<String, Int>()
-                  for (s in slots) for (n in s) if (n != "?" && n != "check") dem[n] = (dem[n] ?: 0) + 1
+                  for (s in slots) for (name in s) if (name != "?" && name != "check") dem[name] = (dem[name] ?: 0) + 1
                   val av = scan(bmp)
                   val active = dem.isNotEmpty() || S.get("idle") == 1
 
@@ -1002,10 +1010,8 @@ jobs:
                       return
                   }
 
-                  // 1. Подача: готовое блюдо тянем к клиенту
                   serve(slots, av)
 
-                  // 2. Приготовление: держим в наличии max(заказы, запас) штук каждого блюда
                   val wCola = target("cola", dem, active) - haveOf("cola") - made("cola")
                   if (wCola > 0 && due("cola", 700L)) {
                       val k = minOf(wCola, 3)
@@ -1047,6 +1053,7 @@ jobs:
           import android.content.pm.ServiceInfo
           import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
           import android.media.projection.MediaProjection
           import android.media.projection.MediaProjectionManager
           import android.os.Build
@@ -1120,23 +1127,51 @@ jobs:
                   tv.setTextColor(Color.WHITE)
                   tv.textSize = 11f
                   tv.text = "Готов"
+                  tv.setPadding(12, 8, 12, 8)
                   val btn = Button(this)
                   btn.text = "СТАРТ"
+                  btn.setTextColor(Color.WHITE)
+                  val startBg = GradientDrawable()
+                  startBg.setColor(Color.rgb(22, 163, 74))
+                  startBg.cornerRadius = 16f
+                  btn.background = startBg
+
+                  val stopBg = GradientDrawable()
+                  stopBg.setColor(Color.rgb(220, 38, 38))
+                  stopBg.cornerRadius = 16f
+
                   val close = Button(this)
-                  close.text = "X"
+                  close.text = "✕"
+                  close.setTextColor(Color.WHITE)
+                  val closeBg = GradientDrawable()
+                  closeBg.setColor(Color.rgb(71, 85, 105))
+                  closeBg.cornerRadius = 16f
+                  close.background = closeBg
+
                   val row = LinearLayout(this)
                   row.orientation = LinearLayout.HORIZONTAL
-                  row.addView(btn)
-                  row.addView(close)
+                  row.setPadding(8, 8, 8, 4)
+                  row.addView(btn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, 86))
+                  val spacer = View(this)
+                  row.addView(spacer, LinearLayout.LayoutParams(10, 1))
+                  row.addView(close, LinearLayout.LayoutParams(90, 86))
+
                   val handle = TextView(this)
-                  handle.text = "✥ тяни за меня"
+                  handle.text = "✥ CookBot · тяни"
                   handle.setTextColor(Color.WHITE)
                   handle.textSize = 12f
-                  handle.setPadding(20, 16, 20, 16)
-                  handle.setBackgroundColor(Color.argb(220, 60, 60, 170))
+                  handle.setPadding(18, 12, 18, 12)
+                  val handleBg = GradientDrawable()
+                  handleBg.setColor(Color.rgb(37, 99, 235))
+                  handleBg.cornerRadii = floatArrayOf(22f, 22f, 22f, 22f, 0f, 0f, 0f, 0f)
+                  handle.background = handleBg
+
                   val box = LinearLayout(this)
                   box.orientation = LinearLayout.VERTICAL
-                  box.setBackgroundColor(Color.argb(150, 0, 0, 0))
+                  val boxBg = GradientDrawable()
+                  boxBg.setColor(Color.argb(205, 15, 23, 42))
+                  boxBg.cornerRadius = 22f
+                  box.background = boxBg
                   box.addView(handle)
                   box.addView(row)
                   box.addView(tv)
@@ -1146,6 +1181,7 @@ jobs:
                           e.running = false
                           engine = null
                           btn.text = "СТАРТ"
+                          btn.background = startBg
                       } else {
                           val c = frames
                           if (c != null) {
@@ -1157,6 +1193,7 @@ jobs:
                               engine = ne
                               ne.start()
                               btn.text = "СТОП"
+                              btn.background = stopBg
                           }
                       }
                   }
@@ -1214,48 +1251,98 @@ jobs:
           import android.app.Activity
           import android.content.Context
           import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
           import android.media.projection.MediaProjectionManager
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.WindowManager
           import android.widget.Button
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
+          import kotlin.math.max
+          import kotlin.math.min
 
           class MainActivity : Activity() {
+              private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
+
+              private fun pillBtn(text: String, bgColor: Int, fgColor: Int = Color.WHITE, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = text
+                  b.setTextColor(fgColor)
+                  b.textSize = 14f
+                  b.setTypeface(null, Typeface.BOLD)
+                  b.isAllCaps = false
+                  val gd = GradientDrawable()
+                  gd.setColor(bgColor)
+                  gd.cornerRadius = dp(14).toFloat()
+                  b.background = gd
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  S.init(this)
+                  if (S.get("screenW") <= 0 || S.get("screenH") <= 0) {
+                      val dm = DisplayMetrics()
+                      @Suppress("DEPRECATION")
+                      (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+                      S.set("screenW", max(dm.widthPixels, dm.heightPixels))
+                      S.set("screenH", min(dm.widthPixels, dm.heightPixels))
+                  }
                   if (Build.VERSION.SDK_INT >= 33) {
                       requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
                   }
                   val l = LinearLayout(this)
                   l.orientation = LinearLayout.VERTICAL
-                  l.setPadding(40, 80, 40, 40)
+                  l.setBackgroundColor(Color.rgb(15, 23, 42))
+                  l.setPadding(dp(18), dp(42), dp(18), dp(28))
+
+                  val header = TextView(this)
+                  header.text = "CookBot · Панель управления"
+                  header.setTextColor(Color.WHITE)
+                  header.textSize = 21f
+                  header.setTypeface(null, Typeface.BOLD)
+                  l.addView(header)
+
                   val info = TextView(this)
-                  info.text = "Выполни шаги 1-3 по порядку, потом открой игру и нажми СТАРТ на плавающей панели (она слева вверху, двигать её можно за синюю полосу)."
+                  info.text = "Выполни шаги 1–3 по порядку, настрой экран при необходимости и нажми СТАРТ на плавающей панели."
+                  info.setTextColor(Color.rgb(148, 163, 184))
+                  info.textSize = 13f
+                  info.setPadding(0, dp(8), 0, dp(16))
                   l.addView(info)
-                  fun add(t: String, a: () -> Unit) {
-                      val b = Button(this)
-                      b.text = t
-                      b.setOnClickListener { a() }
-                      l.addView(b)
+
+                  fun addSpace(h: Int = 10) {
+                      val v = android.view.View(this)
+                      l.addView(v, LinearLayout.LayoutParams(1, dp(h)))
                   }
-                  add("1. Разрешить поверх других окон") {
+
+                  l.addView(pillBtn("1. Разрешить поверх других окон", Color.rgb(30, 41, 59)) {
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
-                  }
-                  add("2. Включить службу спецвозможностей") {
+                  })
+                  addSpace()
+                  l.addView(pillBtn("2. Включить службу спецвозможностей", Color.rgb(30, 41, 59)) {
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                  }
-                  add("Настройки скорости, подачи и запаса") {
+                  })
+                  addSpace()
+                  l.addView(pillBtn("Настройки, экран и экспорт/импорт", Color.rgb(37, 99, 235)) {
                       startActivity(Intent(this, SettingsActivity::class.java))
-                  }
-                  add("3. Запустить бота") {
+                  })
+                  addSpace(14)
+                  l.addView(pillBtn("3. Запустить бота", Color.rgb(22, 163, 74)) {
                       val m = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                       startActivityForResult(m.createScreenCaptureIntent(), 7)
-                  }
+                  })
+
                   val sv = ScrollView(this)
+                  sv.setBackgroundColor(Color.rgb(15, 23, 42))
                   sv.addView(l)
                   setContentView(sv)
               }
@@ -1280,7 +1367,6 @@ jobs:
           import android.content.SharedPreferences
           import java.util.concurrent.ConcurrentHashMap
 
-          // Одна настройка: ключ, раздел, название, значение по умолчанию, диапазон, шаг, единица, подсказка
           class Opt(
               val key: String,
               val group: String,
@@ -1296,8 +1382,10 @@ jobs:
           object S {
               val ALL: List<Opt> = listOf(
                   Opt("autoRound", "Авто-цикл раундов", "Авто-продолжение по билетам", 0, 0, 1, 1, "onoff", "Вкл: после 0 сек через 1 с жмёт Подтвердить, затем Начать, ждёт 3 с и продолжает. При 0 билетов выключается полностью."),
+                  Opt("screenW", "Экран и адаптация", "Ширина экрана (px)", 2712, 720, 4000, 10, "px", "Реальная ширина ландшафтного экрана (например 2712 или 1920)."),
+                  Opt("screenH", "Экран и адаптация", "Высота экрана (px)", 1220, 480, 2400, 10, "px", "Реальная высота ландшафтного экрана (например 1220 или 1080)."),
+                  Opt("screenScale", "Экран и адаптация", "Масштаб точек касания", 100, 60, 140, 1, "%", "Подстройка размера/смещения точек под экран больше или меньше эталона."),
                   Opt("tapGap", "Скорость готовки", "Пауза между кликами", 150, 20, 600, 10, "мс", "Меньше - быстрее. Если игра пропускает клики, увеличь."),
-                  Opt("pizzaGap", "Скорость готовки", "Пауза между кликами по начинке пиццы", 300, 50, 800, 10, "мс", "Колбаса и лук. Слишком быстро - начинка ляжет не на ту основу."),
                   Opt("tapDur", "Скорость готовки", "Длительность одного клика", 30, 10, 200, 5, "мс", "Как долго палец держится на экране."),
                   Opt("swipeDur", "Скорость готовки", "Длительность свайпа", 280, 60, 900, 10, "мс", "Меньше - свайп быстрее. Слишком быстрый игра может не принять."),
                   Opt("loopMs", "Скорость готовки", "Пауза между шагами бота", 150, 50, 1000, 10, "мс", "Как часто бот смотрит на экран и принимает решения."),
@@ -1352,6 +1440,27 @@ jobs:
                   }
               }
 
+              fun exportJson(): String {
+                  val parts = ALL.map { o -> "\"${o.key}\":${get(o.key)}" }
+                  return "{" + parts.joinToString(",") + "}"
+              }
+
+              fun importJson(raw: String): Int {
+                  var applied = 0
+                  val cleaned = raw.trim().removePrefix("{").removeSuffix("}")
+                  if (cleaned.isEmpty()) return 0
+                  for (entry in cleaned.split(",")) {
+                      val kv = entry.split(":")
+                      if (kv.size != 2) continue
+                      val k = kv[0].trim().trim('"')
+                      val v = kv[1].trim().toIntOrNull() ?: continue
+                      val opt = ALL.firstOrNull { it.key == k } ?: continue
+                      set(k, v.coerceIn(opt.min, opt.max))
+                      applied++
+                  }
+                  return applied
+              }
+
               fun text(o: Opt, v: Int): String =
                   if (o.unit == "onoff") (if (v == 1) "вкл" else "выкл") else v.toString() + " " + o.unit
           }
@@ -1360,90 +1469,228 @@ jobs:
           package com.bot.cook
 
           import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
           import android.graphics.Color
           import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
           import android.os.Bundle
           import android.view.Gravity
+          import android.view.View
           import android.widget.Button
+          import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.SeekBar
           import android.widget.TextView
+          import android.widget.Toast
 
           class SettingsActivity : Activity() {
               private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
+
+              private fun styledBtn(label: String, bgColor: Int, fgColor: Int = Color.WHITE): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.setTextColor(fgColor)
+                  b.textSize = 13f
+                  b.setTypeface(null, Typeface.BOLD)
+                  b.isAllCaps = false
+                  val gd = GradientDrawable()
+                  gd.setColor(bgColor)
+                  gd.cornerRadius = dp(12).toFloat()
+                  b.background = gd
+                  return b
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   S.init(this)
                   val root = LinearLayout(this)
                   root.orientation = LinearLayout.VERTICAL
-                  root.setPadding(dp(16), dp(40), dp(16), dp(24))
+                  root.setBackgroundColor(Color.rgb(15, 23, 42))
+                  root.setPadding(dp(16), dp(36), dp(16), dp(28))
+
                   val title = TextView(this)
-                  title.text = "Настройки бота (действуют сразу, даже когда бот работает)"
-                  title.textSize = 18f
+                  title.text = "Настройки CookBot"
+                  title.setTextColor(Color.WHITE)
+                  title.textSize = 20f
                   title.setTypeface(null, Typeface.BOLD)
                   root.addView(title)
+
+                  val sub = TextView(this)
+                  sub.text = "Изменения применяются сразу, даже во время работы бота"
+                  sub.setTextColor(Color.rgb(148, 163, 184))
+                  sub.textSize = 12f
+                  sub.setPadding(0, dp(4), 0, dp(10))
+                  root.addView(sub)
+
+                  val ioRow = LinearLayout(this)
+                  ioRow.orientation = LinearLayout.HORIZONTAL
+                  ioRow.setPadding(0, dp(4), 0, dp(10))
+                  val exportBtn = styledBtn("Экспорт", Color.rgb(37, 99, 235))
+                  val importBtn = styledBtn("Импорт", Color.rgb(16, 185, 129))
+                  exportBtn.setOnClickListener { showExportDialog() }
+                  importBtn.setOnClickListener { showImportDialog() }
+                  ioRow.addView(exportBtn, LinearLayout.LayoutParams(0, dp(46), 1f))
+                  val midGap = View(this)
+                  ioRow.addView(midGap, LinearLayout.LayoutParams(dp(10), 1))
+                  ioRow.addView(importBtn, LinearLayout.LayoutParams(0, dp(46), 1f))
+                  root.addView(ioRow)
+
                   var group = ""
                   for (o in S.ALL) {
                       if (o.group != group) {
                           group = o.group
                           val h = TextView(this)
                           h.text = group
-                          h.textSize = 16f
+                          h.textSize = 15f
                           h.setTypeface(null, Typeface.BOLD)
-                          h.setTextColor(Color.rgb(30, 80, 160))
-                          h.setPadding(0, dp(22), 0, dp(4))
+                          h.setTextColor(Color.rgb(96, 165, 250))
+                          h.setPadding(0, dp(20), 0, dp(6))
                           root.addView(h)
                       }
                       addRow(root, o)
                   }
-                  val reset = Button(this)
-                  reset.text = "Сбросить всё по умолчанию"
+
+                  val gap1 = View(this)
+                  root.addView(gap1, LinearLayout.LayoutParams(1, dp(18)))
+
+                  val reset = styledBtn("Сбросить всё по умолчанию", Color.rgb(185, 28, 28))
                   reset.setOnClickListener {
                       S.reset()
                       recreate()
                   }
-                  root.addView(reset)
-                  val back = Button(this)
-                  back.text = "Назад"
+                  root.addView(reset, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
+
+                  val gap2 = View(this)
+                  root.addView(gap2, LinearLayout.LayoutParams(1, dp(10)))
+
+                  val back = styledBtn("Назад", Color.rgb(51, 65, 85))
                   back.setOnClickListener { finish() }
-                  root.addView(back)
+                  root.addView(back, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
+
+                  // Блок снизу справа: MegaDrocher ❤️‍🔥 (красным), 1599523748 (16745) и кликабельная ссылка t.me/LIGINBILI
+                  val footer = LinearLayout(this)
+                  footer.orientation = LinearLayout.VERTICAL
+                  footer.gravity = Gravity.END
+                  footer.setPadding(0, dp(26), 0, dp(8))
+
+                  val tagTv = TextView(this)
+                  tagTv.text = "MegaDrocher ❤️‍🔥"
+                  tagTv.textSize = 15f
+                  tagTv.setTypeface(null, Typeface.BOLD)
+                  tagTv.setTextColor(Color.parseColor("#FF1744"))
+                  tagTv.gravity = Gravity.END
+                  footer.addView(tagTv)
+
+                  val idTv = TextView(this)
+                  idTv.text = "1599523748 (16745)"
+                  idTv.textSize = 13f
+                  idTv.setTextColor(Color.rgb(226, 232, 240))
+                  idTv.gravity = Gravity.END
+                  idTv.setPadding(0, dp(2), 0, dp(4))
+                  footer.addView(idTv)
+
+                  val linkTv = TextView(this)
+                  linkTv.text = "t.me/LIGINBILI"
+                  linkTv.textSize = 14f
+                  linkTv.setTypeface(null, Typeface.BOLD)
+                  linkTv.setTextColor(Color.rgb(56, 189, 248))
+                  linkTv.gravity = Gravity.END
+                  linkTv.setOnClickListener {
+                      val url = "https://t.me/LIGINBILI"
+                      try {
+                          val tg = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=LIGINBILI"))
+                          startActivity(tg)
+                      } catch (_: Throwable) {
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                      }
+                  }
+                  footer.addView(linkTv)
+
+                  root.addView(footer)
+
                   val sv = ScrollView(this)
+                  sv.setBackgroundColor(Color.rgb(15, 23, 42))
                   sv.addView(root)
                   setContentView(sv)
               }
 
+              private fun showExportDialog() {
+                  val json = S.exportJson()
+                  val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  cm.setPrimaryClip(ClipData.newPlainText("CookBot Settings", json))
+                  AlertDialog.Builder(this)
+                      .setTitle("Экспорт настроек")
+                      .setMessage("Настройки скопированы в буфер обмена:\n\n$json")
+                      .setPositiveButton("ОК", null)
+                      .show()
+              }
+
+              private fun showImportDialog() {
+                  val input = EditText(this)
+                  input.hint = "Вставь строку настроек сюда..."
+                  val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  val clipText = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+                  if (!clipText.isNullOrBlank() && clipText.contains("{")) {
+                      input.setText(clipText)
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("Импорт настроек")
+                      .setView(input)
+                      .setPositiveButton("Применить") { _, _ ->
+                          val count = S.importJson(input.text.toString())
+                          Toast.makeText(this, "Применено параметров: $count", Toast.LENGTH_SHORT).show()
+                          recreate()
+                      }
+                      .setNegativeButton("Отмена", null)
+                      .show()
+              }
+
               private fun addRow(root: LinearLayout, o: Opt) {
+                  val card = LinearLayout(this)
+                  card.orientation = LinearLayout.VERTICAL
+                  val cBg = GradientDrawable()
+                  cBg.setColor(Color.rgb(30, 41, 59))
+                  cBg.cornerRadius = dp(12).toFloat()
+                  card.background = cBg
+                  card.setPadding(dp(12), dp(10), dp(12), dp(10))
+
                   val head = LinearLayout(this)
                   head.orientation = LinearLayout.HORIZONTAL
-                  head.setPadding(0, dp(12), 0, 0)
                   val name = TextView(this)
                   name.text = o.title
                   name.textSize = 14f
+                  name.setTextColor(Color.rgb(241, 245, 249))
+                  name.setTypeface(null, Typeface.BOLD)
                   head.addView(name, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
                   val value = TextView(this)
-                  value.textSize = 16f
+                  value.textSize = 15f
                   value.setTypeface(null, Typeface.BOLD)
-                  value.setTextColor(Color.rgb(200, 60, 0))
+                  value.setTextColor(Color.rgb(251, 146, 60))
                   head.addView(value)
-                  root.addView(head)
+                  card.addView(head)
+
                   if (o.hint.isNotEmpty()) {
                       val hint = TextView(this)
                       hint.text = o.hint
                       hint.textSize = 11f
-                      hint.setTextColor(Color.GRAY)
-                      root.addView(hint)
+                      hint.setTextColor(Color.rgb(148, 163, 184))
+                      hint.setPadding(0, dp(3), 0, dp(6))
+                      card.addView(hint)
                   }
+
                   val row = LinearLayout(this)
                   row.orientation = LinearLayout.HORIZONTAL
                   row.gravity = Gravity.CENTER_VERTICAL
-                  val minus = Button(this)
-                  minus.text = "-"
+                  val minus = styledBtn("−", Color.rgb(51, 65, 85))
                   minus.minWidth = 0
                   minus.minimumWidth = 0
-                  val plus = Button(this)
-                  plus.text = "+"
+                  val plus = styledBtn("+", Color.rgb(51, 65, 85))
                   plus.minWidth = 0
                   plus.minimumWidth = 0
                   val sb = SeekBar(this)
@@ -1464,10 +1711,14 @@ jobs:
                   })
                   minus.setOnClickListener { sb.progress = maxOf(0, sb.progress - 1) }
                   plus.setOnClickListener { sb.progress = minOf(sb.max, sb.progress + 1) }
-                  row.addView(minus, LinearLayout.LayoutParams(dp(52), dp(48)))
+                  row.addView(minus, LinearLayout.LayoutParams(dp(48), dp(42)))
                   row.addView(sb, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                  row.addView(plus, LinearLayout.LayoutParams(dp(52), dp(48)))
-                  root.addView(row)
+                  row.addView(plus, LinearLayout.LayoutParams(dp(48), dp(42)))
+                  card.addView(row)
+
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(8)
+                  root.addView(card, lp)
               }
           }
           EOF_17
