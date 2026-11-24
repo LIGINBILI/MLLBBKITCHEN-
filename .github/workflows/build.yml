@@ -145,6 +145,9 @@ jobs:
               val PATTY = p(2110, 955)
               val GRILLS = listOf(p(1970, 670), p(2170, 670), p(1990, 760), p(2170, 760))
 
+              val BTN_CONFIRM = p(1280, 982)
+              val BTN_START = p(2230, 1045)
+
               // Где лежит готовое блюдо каждого типа (оттуда его тянут к клиенту)
               val SERVE: Map<String, List<IntArray>> = mapOf(
                   "cola" to listOf(p(415, 590), p(470, 615), p(540, 565)),
@@ -265,6 +268,60 @@ jobs:
                       res.add(if (bd > 25) "?" else best)
                   }
                   return res
+              }
+
+              // Экран конца раунда с жёлтой кнопкой "Подтвердить"
+              fun isRoundEnd(bmp: Bitmap): Boolean {
+                  val x0 = 1160
+                  val y0 = 955
+                  val w = 240
+                  val h = 55
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, x0, y0, w, h)
+                  var gold = 0
+                  for (c in px) {
+                      val r = (c shr 16) and 255
+                      val g = (c shr 8) and 255
+                      val b = c and 255
+                      if (r > 215 && g > 165 && b < 90) gold++
+                  }
+                  return gold.toDouble() / px.size > 0.35
+              }
+
+              // Экран лобби с жёлтой кнопкой "Начать" внизу справа
+              fun isLobbyStart(bmp: Bitmap): Boolean {
+                  val x0 = 2130
+                  val y0 = 1015
+                  val w = 200
+                  val h = 60
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, x0, y0, w, h)
+                  var gold = 0
+                  for (c in px) {
+                      val r = (c shr 16) and 255
+                      val g = (c shr 8) and 255
+                      val b = c and 255
+                      if (r > 215 && g > 165 && b < 90) gold++
+                  }
+                  return gold.toDouble() / px.size > 0.30
+              }
+
+              // Есть ли билеты в правом верхнем углу лобби (0 билетов -> нет ярких цифр у иконки билета)
+              fun hasTickets(bmp: Bitmap): Boolean {
+                  val x0 = 2215
+                  val y0 = 42
+                  val w = 75
+                  val h = 38
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, x0, y0, w, h)
+                  var bright = 0
+                  for (c in px) {
+                      val r = (c shr 16) and 255
+                      val g = (c shr 8) and 255
+                      val b = c and 255
+                      if (r > 195 && g > 195 && b > 195) bright++
+                  }
+                  return bright >= 18
               }
 
               // 0 - пусто, 1 - сырая котлета, 2 - готовая
@@ -581,7 +638,11 @@ jobs:
 
           class Src(val key: String, val p: IntArray)
 
-          class Engine(private val cap: Frames, private val ui: (String) -> Unit) : Thread() {
+          class Engine(
+              private val cap: Frames,
+              private val ui: (String) -> Unit,
+              private val onStopBot: (() -> Unit)? = null
+          ) : Thread() {
               @Volatile
               var running = true
               private val last = HashMap<String, Long>()
@@ -597,6 +658,14 @@ jobs:
               private var frames = 0
               private var burgerAssembleAt = 0L
               private var pizzaBusyUntil = 0L
+
+              // Состояние авто-цикла раундов:
+              // 0 - обычный раунд, 1 - ждём 1с после конца раунда и жмём Подтвердить,
+              // 2 - ждём кнопку Начать и жмём её, 3 - ждём 3с после Начать и возобновляем работу
+              private var roundPhase = 0
+              private var endSeenAt = 0L
+              private var lobbySince = 0L
+              private var startClickedAt = 0L
 
               // Сколько миллисекунд блюдо считается "уже поставлено готовиться"
               private fun pend(dish: String): Long = when (dish) {
@@ -652,6 +721,27 @@ jobs:
 
               private fun go(acts: List<Act>, gap: Long = S.get("tapGap").toLong()) {
                   if (acts.isNotEmpty()) TapService.run(acts, gap)
+              }
+
+              private fun resetRoundState() {
+                  last.clear()
+                  collectAt.clear()
+                  cookN.clear()
+                  seen.clear()
+                  firstSeen.clear()
+                  usedAt.clear()
+                  sentAt.clear()
+                  madeAt.clear()
+                  tapAt.clear()
+                  have.clear()
+                  burgerAssembleAt = 0L
+                  pizzaBusyUntil = 0L
+              }
+
+              private fun stopBotCompletely(msg: String) {
+                  running = false
+                  ui(msg)
+                  onStopBot?.invoke()
               }
 
               // Сколько штук блюда держать готовыми: заказы клиентов или запас из настроек (что больше), но не больше мест
@@ -817,6 +907,60 @@ jobs:
                   }
               }
 
+              private fun handleAutoRound(bmp: Bitmap): Boolean {
+                  if (S.get("autoRound") == 0) return false
+                  val n = now()
+                  if (roundPhase == 0) {
+                      if (Vision.isRoundEnd(bmp)) {
+                          roundPhase = 1
+                          endSeenAt = n
+                          resetRoundState()
+                          ui("Раунд окончен — жду 1с до Подтвердить")
+                          return true
+                      }
+                      return false
+                  }
+                  // На фазах 1..3 запрещены любые другие клики кроме Подтвердить -> Начать
+                  if (roundPhase == 1) {
+                      ui("Авто-цикл: жду Подтвердить...")
+                      if (n - endSeenAt >= 1000L) {
+                          go(listOf(tapA(Cfg.BTN_CONFIRM)))
+                          roundPhase = 2
+                          lobbySince = n
+                          startClickedAt = 0L
+                      }
+                      return true
+                  }
+                  if (roundPhase == 2) {
+                      if (!Vision.hasTickets(bmp) && n - lobbySince >= 1800L) {
+                          stopBotCompletely("Билеты закончились — бот выключен")
+                          return true
+                      }
+                      if (startClickedAt == 0L && Vision.isLobbyStart(bmp) && n - lobbySince >= 600L) {
+                          ui("Авто-цикл: жму Начать")
+                          go(listOf(tapA(Cfg.BTN_START)))
+                          startClickedAt = n
+                          roundPhase = 3
+                          return true
+                      }
+                      if (n - lobbySince > 12000L) {
+                          stopBotCompletely("Нет билетов / старт не найден — выключен")
+                          return true
+                      }
+                      ui("Авто-цикл: переход в лобби...")
+                      return true
+                  }
+                  // roundPhase == 3: ждём 3 секунды после нажатия Начать
+                  val rem = maxOf(0L, 3000L - (n - startClickedAt))
+                  if (rem > 0L) {
+                      ui("Старт через " + ((rem + 999L) / 1000L) + " с...")
+                      return true
+                  }
+                  roundPhase = 0
+                  resetRoundState()
+                  return false
+              }
+
               private fun step() {
                   val bmp = cap.frame()
                   if (bmp == null) {
@@ -825,6 +969,15 @@ jobs:
                       return
                   }
                   frames++
+                  if (!TapService.ready()) {
+                      ui("Включи службу спецвозможностей!")
+                      Thread.sleep(500)
+                      return
+                  }
+                  if (handleAutoRound(bmp)) {
+                      Thread.sleep(200)
+                      return
+                  }
                   val slots = Vision.SLOT_X.map { Vision.slotItems(bmp, it) }
                   val dem = HashMap<String, Int>()
                   for (s in slots) for (n in s) if (n != "?" && n != "check") dem[n] = (dem[n] ?: 0) + 1
@@ -843,11 +996,6 @@ jobs:
                   sb.append("\n")
                   sb.append("кадр ").append(frames).append("\n")
                   sb.append(cap.info()).append(" sig=").append(Integer.toHexString(sig(bmp)).takeLast(5))
-                  if (!TapService.ready()) {
-                      ui(sb.toString() + "\nВключи службу спецвозможностей!")
-                      Thread.sleep(500)
-                      return
-                  }
                   ui(sb.toString())
                   if (!active && collectAt.isEmpty()) {
                       Thread.sleep(300)
@@ -1001,7 +1149,11 @@ jobs:
                       } else {
                           val c = frames
                           if (c != null) {
-                              val ne = Engine(c) { s -> main.post { tv.text = s } }
+                              val ne = Engine(
+                                  c,
+                                  { s -> main.post { tv.text = s } },
+                                  { main.post { stopSelf() } }
+                              )
                               engine = ne
                               ne.start()
                               btn.text = "СТОП"
@@ -1143,6 +1295,7 @@ jobs:
 
           object S {
               val ALL: List<Opt> = listOf(
+                  Opt("autoRound", "Авто-цикл раундов", "Авто-продолжение по билетам", 0, 0, 1, 1, "onoff", "Вкл: после 0 сек через 1 с жмёт Подтвердить, затем Начать, ждёт 3 с и продолжает. При 0 билетов выключается полностью."),
                   Opt("tapGap", "Скорость готовки", "Пауза между кликами", 150, 20, 600, 10, "мс", "Меньше - быстрее. Если игра пропускает клики, увеличь."),
                   Opt("pizzaGap", "Скорость готовки", "Пауза между кликами по начинке пиццы", 300, 50, 800, 10, "мс", "Колбаса и лук. Слишком быстро - начинка ляжет не на ту основу."),
                   Opt("tapDur", "Скорость готовки", "Длительность одного клика", 30, 10, 200, 5, "мс", "Как долго палец держится на экране."),
