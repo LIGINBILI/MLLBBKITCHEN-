@@ -180,6 +180,22 @@ jobs:
               private fun d(c: Int, r: Int, g: Int, b: Int): Int =
                   abs(((c shr 16) and 255) - r) + abs(((c shr 8) and 255) - g) + abs((c and 255) - b)
 
+              private fun isGreenCheck(px: IntArray, w: Int, h: Int, x0: Int, y0: Int, ry0: Int, r0: Int, r1: Int): Boolean {
+                  var greenPx = 0
+                  var total = 0
+                  for (y in r0 until r1) {
+                      for (x in x0 until x0 + w) {
+                          val c = px[(y - ry0) * w + (x - x0)]
+                          val r = (c shr 16) and 255
+                          val g = (c shr 8) and 255
+                          val b = c and 255
+                          total++
+                          if (g > 140 && g - r > 45 && g - b > 25) greenPx++
+                      }
+                  }
+                  return total > 0 && greenPx.toDouble() / total > 0.08
+              }
+
               // Читает заказ одного клиента: список блюд сверху вниз
               fun slotItems(bmp: Bitmap, cx: Int): List<String> {
                   val x0 = cx - 40
@@ -214,6 +230,10 @@ jobs:
 
                   val res = ArrayList<String>()
                   for (run in runs) {
+                      if (isGreenCheck(px, w, h, x0, ry0, ry0, run[0], run[1])) {
+                          res.add("check")
+                          continue
+                      }
                       val cy = (run[0] + run[1]) / 2
                       val f = IntArray(192)
                       for (by in 0 until 8) for (bx in 0 until 8) {
@@ -594,7 +614,8 @@ jobs:
 
               private val ru = mapOf(
                   "pizza" to "пицца", "burger" to "бургер", "cola" to "кола",
-                  "icecream" to "мороженое", "fries" to "фри", "chicken" to "курица", "?" to "?"
+                  "icecream" to "мороженое", "fries" to "фри", "chicken" to "курица",
+                  "check" to "✓", "?" to "?"
               )
 
               private fun now() = System.currentTimeMillis()
@@ -715,7 +736,7 @@ jobs:
                   for ((si, items) in slots.withIndex()) {
                       val counts = items.groupingBy { it }.eachCount()
                       for ((name, cnt) in counts) {
-                          if (name == "?") continue
+                          if (name == "?" || name == "check") continue
                           val list = av[name] ?: continue
                           var need = cnt - recent(sentAt, "" + si + name, 2000L)
                           val c = Cfg.customer(Vision.SLOT_X[si])
@@ -815,7 +836,7 @@ jobs:
                   frames++
                   val slots = Vision.SLOT_X.map { Vision.slotItems(bmp, it) }
                   val dem = HashMap<String, Int>()
-                  for (s in slots) for (n in s) if (n != "?") dem[n] = (dem[n] ?: 0) + 1
+                  for (s in slots) for (n in s) if (n != "?" && n != "check") dem[n] = (dem[n] ?: 0) + 1
                   val av = scan(bmp)
                   val active = dem.isNotEmpty() || S.get("idle") == 1
 
@@ -1138,8 +1159,8 @@ jobs:
                   Opt("serveDelay", "Подача клиентам", "Задержка перед подачей", 0, 0, 5000, 100, "мс", "Сколько блюдо должно полежать готовым, прежде чем бот его отдаст."),
                   Opt("serveGap", "Подача клиентам", "Пауза между свайпами при подаче", 100, 20, 800, 10, "мс", ""),
                   Opt("serveMax", "Подача клиентам", "Макс. свайпов за раз", 6, 1, 8, 1, "шт", "Сколько блюд бот отдаёт за один заход."),
-                  Opt("dropDx", "Подача клиентам", "Точка сброса: сдвиг влево от окошка заказа", 220, 0, 400, 10, "px", "Если блюдо не доходит до клиента, меняй это и высоту."),
-                  Opt("dropY", "Подача клиентам", "Точка сброса: высота", 430, 250, 600, 10, "px", "Больше - ниже на экране."),
+                  Opt("dropDx", "Подача клиентам", "Точка сброса: сдвиг влево от окошка заказа", 140, 0, 350, 10, "px", "Если блюдо не доходит до клиента, меняй это и высоту."),
+                  Opt("dropY", "Подача клиентам", "Точка сброса: высота", 340, 200, 550, 10, "px", "Больше - ниже на экране."),
                   Opt("idle", "Запас (готовить заранее)", "Готовить запас, когда нет заказов", 0, 0, 1, 1, "onoff", "Выкл: запас готовится, только пока есть хотя бы один заказ."),
                   Opt("stBurger", "Запас (готовить заранее)", "Бургеры в запасе", 4, 0, 4, 1, "шт", "Сколько бургеров держать готовыми. 0 - только под заказ."),
                   Opt("stPizza", "Запас (готовить заранее)", "Пиццы в запасе", 3, 0, 3, 1, "шт", "Печь вмещает 3."),
@@ -1309,4 +1330,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: CookBot-apk
-          path: bot/app/build/outputs/apk/debug/app-debug.apk
+          path: bot/app/build/outputs/apk/debug/app-debug.apk 
