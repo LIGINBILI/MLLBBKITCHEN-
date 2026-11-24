@@ -595,11 +595,7 @@ jobs:
               private val tapAt = HashMap<String, Long>()
               private val have = HashMap<String, Int>()
               private var frames = 0
-              private var bPhase = 0
-              private var bNeed = 0
-              private var bGot = 0
-              private var bStart = 0L
-              private var bBlock = 0L
+              private var burgerAssembleAt = 0L
               private var pizzaBusyUntil = 0L
 
               // Сколько миллисекунд блюдо считается "уже поставлено готовиться"
@@ -790,39 +786,34 @@ jobs:
               private fun burger(tgt: Int, bmp: Bitmap) {
                   val hb = haveOf("burger")
                   val gs = Cfg.GRILLS.map { Vision.grillState(bmp, it[0], it[1]) }
-                  if (bPhase == 0) {
-                      val need = minOf(4 - hb, tgt - hb)
-                      if (now() > bBlock && need > 0 && due("bstart", 2000L)) {
-                          val free = gs.count { it == 0 }
-                          val onGrill = gs.count { it != 0 }
-                          val raw = minOf(free, maxOf(0, need - onGrill))
-                          val acts = ArrayList<Act>()
-                          for (i in 0 until raw) acts.add(tapA(Cfg.PATTY))
-                          for (i in 0 until need) acts.add(tapA(Cfg.LETTUCE))
-                          for (i in 0 until need) acts.add(tapA(Cfg.TOMATO))
-                          go(acts)
-                          bPhase = 1
-                          bNeed = need
-                          bGot = 0
-                          bStart = now()
+                  val readyGrills = gs.filterIndexed { i, st -> st == 2 }.mapIndexed { idx, _ ->
+                      Cfg.GRILLS[gs.withIndex().filter { it.value == 2 }.map { it.index }[idx]]
+                  }
+                  val onGrill = gs.count { it != 0 }
+                  val freeGrill = gs.count { it == 0 }
+                  val n = now()
+
+                  // 1. Если есть готовая котлета на гриле и есть место на тарелках — забираем и собираем бургер
+                  if (readyGrills.isNotEmpty() && hb < 4 && n >= burgerAssembleAt && due("b_take", 700L)) {
+                      val roomPlates = 4 - hb
+                      val take = readyGrills.take(roomPlates)
+                      val acts = ArrayList<Act>()
+                      for (g in take) acts.add(tapA(g))
+                      for (i in 0 until take.size) {
+                          acts.add(tapA(Cfg.LETTUCE))
+                          acts.add(tapA(Cfg.TOMATO))
+                          acts.add(tapA(Cfg.BUN))
                       }
-                  } else {
-                      val ready = ArrayList<IntArray>()
-                      for ((i, g) in Cfg.GRILLS.withIndex()) if (gs[i] == 2) ready.add(g)
-                      if (ready.isNotEmpty() && bGot < bNeed && due("grl", 900L)) {
-                          val take = ready.take(bNeed - bGot)
-                          go(take.map { tapA(it) })
-                          bGot += take.size
-                      }
-                      if (bGot >= bNeed || now() - bStart > 25000L) {
-                          if (bGot > 0) {
-                              val acts = ArrayList<Act>()
-                              for (i in 0 until bGot) acts.add(tapA(Cfg.BUN))
-                              go(acts)
-                          }
-                          bPhase = 0
-                          bBlock = now() + 2500L
-                      }
+                      go(acts)
+                      burgerAssembleAt = n + 1400L
+                      return
+                  }
+
+                  // 2. Если нужно больше бургеров и есть свободные слоты на гриле — кладём сырые котлеты
+                  val wantMore = minOf(4 - hb, tgt - hb) - onGrill
+                  if (wantMore > 0 && freeGrill > 0 && due("b_patty", 900L)) {
+                      val putCount = minOf(wantMore, freeGrill)
+                      go(List(putCount) { tapA(Cfg.PATTY) })
                   }
               }
 
@@ -858,7 +849,7 @@ jobs:
                       return
                   }
                   ui(sb.toString())
-                  if (!active && bPhase == 0 && collectAt.isEmpty()) {
+                  if (!active && collectAt.isEmpty()) {
                       Thread.sleep(300)
                       return
                   }
@@ -889,7 +880,9 @@ jobs:
                   val wPiz = target("pizza", dem, active) - haveOf("pizza") - made("pizza")
                   if (wPiz > 0) pizza(wPiz)
                   val tBur = target("burger", dem, active)
-                  if (tBur > haveOf("burger") || bPhase != 0) burger(tBur, bmp)
+                  if (tBur > haveOf("burger") || Cfg.GRILLS.any { Vision.grillState(bmp, it[0], it[1]) != 0 }) {
+                      burger(tBur, bmp)
+                  }
               }
           }
           EOF_12
