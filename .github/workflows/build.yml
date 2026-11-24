@@ -154,7 +154,6 @@ jobs:
                           return
                       } catch (_: Throwable) {
                       }
-                      // Fallback через MediaStore для Android 10+ при ограничениях прямой записи
                       val ctx = appCtx ?: return
                       if (Build.VERSION.SDK_INT >= 29) {
                           try {
@@ -184,8 +183,9 @@ jobs:
                                   }
                                   mediaUri = uri
                               }
-                              if (uri != null) {
-                                  resolver.openOutputStream(uri, "wa")?.use { os ->
+                              val targetUri = uri
+                              if (targetUri != null) {
+                                  resolver.openOutputStream(targetUri, "wa")?.use { os ->
                                       os.write(line.toByteArray(Charsets.UTF_8))
                                       os.flush()
                                   }
