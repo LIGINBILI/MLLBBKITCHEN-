@@ -100,7 +100,7 @@ jobs:
           cat > bot/app/src/main/res/values/strings.xml <<'EOF_6'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">MegaDrocher</string>
+              <string name="app_name">tg@aiym_ln </string>
               <string name="desc">Нажатия на экран для автоигры</string>
           </resources>
           EOF_6
