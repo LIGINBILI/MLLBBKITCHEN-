@@ -100,7 +100,7 @@ jobs:
           cat > bot/app/src/main/res/values/strings.xml <<'EOF_6'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <string name="app_name">MegaDrocher</string>
+              <string name="app_name">Mega Drocher</string>
               <string name="desc">Нажатия на экран для автоигры</string>
           </resources>
           EOF_6
@@ -639,7 +639,6 @@ jobs:
           package com.bot.cook
 
           import android.graphics.Bitmap
-          import kotlin.math.maxOf
 
           class Src(val key: String, val p: IntArray)
 
@@ -1573,7 +1572,6 @@ jobs:
                   back.setOnClickListener { finish() }
                   root.addView(back, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
 
-                  // Блок снизу справа: MegaDrocher ❤️‍🔥 (красным), 1599523748 (16745) и кликабельная ссылка t.me/LIGINBILI
                   val footer = LinearLayout(this)
                   footer.orientation = LinearLayout.VERTICAL
                   footer.gravity = Gravity.END
